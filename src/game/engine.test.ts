@@ -10,9 +10,11 @@ import {
   continueAfterSpecialRoom,
   createTitleState,
   enterRevealedRoom,
+  gameReducer,
   getCurrentTurn,
   getEffectiveEnemyStats,
   getEffectivePlayerStats,
+  getProjectedTurnOrder,
   getTargetableEnemies,
   leaveVendor,
   resolveEnemyTurn,
@@ -23,6 +25,7 @@ import {
   resolveVendorTrade,
   resolveWitchRoom,
   startNewGame,
+  swapPlayerPosition,
   toggleCharacterSelection,
   useLoot,
   usePlayerAbility,
@@ -56,13 +59,20 @@ function setupRoom(
 ): GameState {
   let state = startNewGame(createTitleState(), seed);
   for (const characterId of party) state = toggleCharacterSelection(state, characterId);
-  state = confirmParty(state);
-  (["A", "B", "C", "D"] as PlayerPosition[]).forEach((position, index) => {
-    state = assignPosition(state, state.players[index].id, position);
-  });
   state = { ...state, playDeck: [definition(roomId)] };
-  state = confirmPositions(state);
+  state = confirmParty(state);
   return enterRevealedRoom(state);
+}
+
+function setupRevealedRoom(
+  roomId: string,
+  party = defaultParty,
+  seed = `test-reveal-${roomId}`,
+): GameState {
+  let state = startNewGame(createTitleState(), seed);
+  for (const characterId of party) state = toggleCharacterSelection(state, characterId);
+  state = { ...state, playDeck: [definition(roomId)] };
+  return confirmParty(state);
 }
 
 function atTurn(state: GameState, predicate: (slot: TurnSlot) => boolean): GameState {
@@ -108,13 +118,34 @@ describe("deterministic setup and phase flow", () => {
     expect(source).toEqual([1, 2, 3, 4, 5]);
   });
 
-  it("requires four unique positions before revealing a room", () => {
+  it("auto-assigns selected heroes to A-D and reveals the first room", () => {
     let state = startNewGame(createTitleState(), "positions");
     for (const id of defaultParty) state = toggleCharacterSelection(state, id);
+    const firstRoomId = state.playDeck[0].id;
     state = confirmParty(state);
-    expect(state.phase).toBe("POSITION_ASSIGNMENT");
-    state = assignPosition(state, state.players[0].id, "A");
-    expect(confirmPositions(state).phase).toBe("POSITION_ASSIGNMENT");
+    expect(state.phase).toBe("ROOM_REVEAL");
+    expect(state.players.map(({ position }) => position)).toEqual(["A", "B", "C", "D"]);
+    expect(state.players.map(({ characterId }) => characterId)).toEqual(defaultParty);
+    expect(state.currentRoom?.definitionId).toBe(firstRoomId);
+    expect(state.turn).toBeNull();
+  });
+
+  it("keeps legacy manual assignment and confirmation available", () => {
+    let state = startNewGame(createTitleState(), "legacy-position-controls");
+    for (const id of defaultParty) state = toggleCharacterSelection(state, id);
+    state = confirmParty(state);
+    state = {
+      ...state,
+      phase: "POSITION_ASSIGNMENT",
+      currentRoom: null,
+      players: state.players.map((player) => ({ ...player, position: null })),
+    };
+    (["D", "C", "B", "A"] as PlayerPosition[]).forEach((position, index) => {
+      state = assignPosition(state, state.players[index].id, position);
+    });
+    state = confirmPositions(state);
+    expect(state.phase).toBe("ROOM_REVEAL");
+    expect(state.players.map(({ position }) => position)).toEqual(["D", "C", "B", "A"]);
   });
 
   it("creates unique runtime enemy and turn-slot ids", () => {
@@ -124,6 +155,112 @@ describe("deterministic setup and phase flow", () => {
     expect(new Set(ids).size).toBe(ids.length);
     const giantSlots = state.turn!.order.filter((slot) => slot.actorType === "enemy");
     expect(new Set(giantSlots.map(({ actorId }) => actorId)).size).toBe(1);
+  });
+});
+
+describe("per-room combat preparation", () => {
+  it("atomically swaps occupied positions and immediately changes the projected order", () => {
+    const state = setupRevealedRoom("room-2");
+    const playerA = state.players.find(({ position }) => position === "A")!;
+    const playerB = state.players.find(({ position }) => position === "B")!;
+    const before = getProjectedTurnOrder(state);
+
+    const swapped = gameReducer(state, {
+      type: "SWAP_PLAYER_POSITION",
+      playerId: playerA.id,
+      targetPosition: "B",
+    });
+
+    expect(swapped.players.find(({ id }) => id === playerA.id)?.position).toBe("B");
+    expect(swapped.players.find(({ id }) => id === playerB.id)?.position).toBe("A");
+    expect(new Set(swapped.players.map(({ position }) => position))).toEqual(new Set(["A", "B", "C", "D"]));
+    expect(getProjectedTurnOrder(swapped)).not.toEqual(before);
+    expect(getProjectedTurnOrder(swapped).find(
+      (slot) => slot.actorType === "player" && slot.position === "A",
+    )?.actorId).toBe(playerB.id);
+    expect(swapPlayerPosition(swapped, playerA.id, "B")).toBe(swapped);
+  });
+
+  it("rejects formation changes after combat begins and during loot", () => {
+    const revealed = setupRevealedRoom("room-2");
+    const playerA = revealed.players.find(({ position }) => position === "A")!;
+    const combat = enterRevealedRoom(revealed);
+    const rejectedCombat = swapPlayerPosition(combat, playerA.id, "B");
+    expect(rejectedCombat.players).toEqual(combat.players);
+    expect(rejectedCombat.turn).toEqual(combat.turn);
+    expect(rejectedCombat.log.at(-1)?.level).toBe("error");
+
+    const loot = { ...revealed, phase: "LOOT_REWARD" as const };
+    const rejectedLoot = swapPlayerPosition(loot, playerA.id, "B");
+    expect(rejectedLoot.players).toEqual(loot.players);
+    expect(rejectedLoot.log.at(-1)?.level).toBe("error");
+  });
+
+  it("uses the same projected order for combat, including duplicate enemies and repeated actions", () => {
+    let state = setupRevealedRoom("room-1");
+    if (state.currentRoom?.type !== "combat") throw new Error("Expected combat room.");
+    const giant = state.currentRoom.enemies[0];
+    const secondGiant = { ...giant, id: `${giant.id}:duplicate` };
+    state = {
+      ...state,
+      currentRoom: {
+        ...state.currentRoom,
+        enemies: [giant, secondGiant],
+        rawTurnOrder: [
+          "enemy:giant:1",
+          "enemy:giant:1",
+          "player:A",
+          "enemy:giant:3",
+          "player:B",
+        ],
+      },
+    };
+
+    const projected = getProjectedTurnOrder(state);
+    const enemySlots = projected.filter((slot) => slot.actorType === "enemy");
+    expect(enemySlots.map(({ actorId }) => actorId)).toEqual([giant.id, secondGiant.id, giant.id]);
+    expect(enemySlots.map(({ actionId }) => actionId)).toEqual(["1", "1", "3"]);
+
+    const combat = enterRevealedRoom(state);
+    expect(combat.turn?.order).toEqual(projected);
+  });
+
+  it("retains formation for room two and permits another preparation swap", () => {
+    let state = startNewGame(createTitleState(), "room-two-preparation");
+    for (const id of defaultParty) state = toggleCharacterSelection(state, id);
+    state = { ...state, playDeck: [definition("room-1"), definition("room-2")] };
+    state = confirmParty(state);
+    state = swapPlayerPosition(state, state.players[0].id, "D");
+    const retainedFormation = state.players.map(({ id, position }) => ({ id, position }));
+
+    state = continueAfterLoot({
+      ...state,
+      phase: "LOOT_REWARD",
+      pendingLootReward: [],
+    });
+    expect(state.phase).toBe("ROOM_REVEAL");
+    expect(state.roomIndex).toBe(1);
+    expect(state.currentRoom?.definitionId).toBe("room-2");
+    expect(state.players.map(({ id, position }) => ({ id, position }))).toEqual(retainedFormation);
+
+    const projectedBefore = getProjectedTurnOrder(state);
+    const playerAtA = state.players.find(({ position }) => position === "A")!;
+    state = swapPlayerPosition(state, playerAtA.id, "B");
+    expect(getProjectedTurnOrder(state)).not.toEqual(projectedBefore);
+  });
+
+  it("preserves formation through special rooms without exposing a projected combat order", () => {
+    const revealed = setupRevealedRoom("healing-spring");
+    const formation = revealed.players.map(({ id, position }) => ({ id, position }));
+    expect(getProjectedTurnOrder(revealed)).toEqual([]);
+
+    const rejected = swapPlayerPosition(revealed, revealed.players[0].id, "B");
+    expect(rejected.players.map(({ id, position }) => ({ id, position }))).toEqual(formation);
+    expect(rejected.log.at(-1)?.level).toBe("error");
+
+    const entered = enterRevealedRoom(revealed);
+    expect(entered.phase).toBe("SPECIAL_ROOM");
+    expect(entered.players.map(({ id, position }) => ({ id, position }))).toEqual(formation);
   });
 });
 
@@ -436,12 +573,8 @@ describe("loot, special rooms, victory, and saves", () => {
     let state = startNewGame(createTitleState(), "first-room-progression");
     for (const characterId of defaultParty) state = toggleCharacterSelection(state, characterId);
     state = confirmParty(state);
-    (["A", "B", "C", "D"] as PlayerPosition[]).forEach((position, index) => {
-      state = assignPosition(state, state.players[index].id, position);
-    });
     const expectedSecondRoom = state.playDeck[1];
 
-    state = confirmPositions(state);
     state = enterRevealedRoom(state);
     state = atTurn(state, (slot) => slot.actorType === "player" && slot.position === "A");
     if (state.currentRoom?.type !== "combat") throw new Error("Expected the first deck room to be combat.");
@@ -644,6 +777,56 @@ describe("loot, special rooms, victory, and saves", () => {
     const boss = getTargetableEnemies(victory)[0];
     victory = usePlayerAbility(victory, { playerId: victory.players[0].id, abilityId: "sword-attack", targetIds: [boss.id] }, [6]);
     expect(victory.phase).toBe("VICTORY");
+  });
+
+  it("round-trips a swapped preparation without changing its formation or preview", () => {
+    let state = setupRevealedRoom("room-2");
+    state = swapPlayerPosition(state, state.players[0].id, "C");
+    const preview = getProjectedTurnOrder(state);
+
+    const restored = deserializeGame(serializeGame(state));
+    expect(restored.phase).toBe("ROOM_REVEAL");
+    expect(restored.players.map(({ id, position }) => ({ id, position }))).toEqual(
+      state.players.map(({ id, position }) => ({ id, position })),
+    );
+    expect(getProjectedTurnOrder(restored)).toEqual(preview);
+  });
+
+  it("preserves the already-frozen turn order and cursor in an active-combat save", () => {
+    let state = setupRevealedRoom("room-3");
+    state = swapPlayerPosition(state, state.players[0].id, "D");
+    state = enterRevealedRoom(state);
+    state = { ...state, turn: { ...state.turn!, index: 3, actionsResolved: 7 } };
+    const frozenTurn = state.turn;
+
+    const restored = deserializeGame(serializeGame(state));
+    expect(restored.phase).toBe("COMBAT");
+    expect(restored.turn).toEqual(frozenTurn);
+  });
+
+  it("migrates a partial legacy position-assignment save into room-one preparation", () => {
+    let state = startNewGame(createTitleState(), "legacy-partial-save");
+    for (const id of defaultParty) state = toggleCharacterSelection(state, id);
+    state = confirmParty(state);
+    const firstRoomId = state.playDeck[0].id;
+    const partialPositions: Array<PlayerPosition | null> = ["C", null, "A", null];
+    state = {
+      ...state,
+      phase: "POSITION_ASSIGNMENT",
+      currentRoom: null,
+      turn: null,
+      players: state.players.map((player, index) => ({
+        ...player,
+        position: partialPositions[index],
+      })),
+    };
+
+    const restored = deserializeGame(serializeGame(state));
+    expect(restored.stateVersion).toBe(1);
+    expect(restored.phase).toBe("ROOM_REVEAL");
+    expect(restored.roomIndex).toBe(0);
+    expect(restored.currentRoom?.definitionId).toBe(firstRoomId);
+    expect(restored.players.map(({ position }) => position)).toEqual(["C", "B", "A", "D"]);
   });
 
   it("round-trips a versioned save while reattaching current content", () => {

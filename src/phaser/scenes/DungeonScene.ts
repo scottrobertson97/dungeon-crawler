@@ -14,6 +14,7 @@ import {
   getCurrentTurn,
   getEffectiveEnemyStats,
   getEffectivePlayerStats,
+  getProjectedTurnOrder,
   getTargetableEnemies,
   leaveVendor,
   resolveEnemyTurn,
@@ -22,6 +23,7 @@ import {
   resolveVendorTrade,
   resolveWitchRoom,
   startNewGame,
+  swapPlayerPosition,
   transferLoot,
   toggleCharacterSelection,
   unequipLoot,
@@ -71,6 +73,8 @@ export class DungeonScene extends Phaser.Scene {
   private screen!: Phaser.GameObjects.Container;
   private rulesOpen = false;
   private positionCandidateId: string | null = null;
+  private preparationCandidateId: string | null = null;
+  private preparationTurnSlotId: string | null = null;
   private selectedAbilityId: string | null = null;
   private selectedTargets = new Set<string>();
   private allocation: Record<string, number> = {};
@@ -87,6 +91,7 @@ export class DungeonScene extends Phaser.Scene {
 
   create(): void {
     this.cameras.main.setBackgroundColor(COLORS.ink);
+    this.input.dragDistanceThreshold = 8;
     this.savedState = loadGame();
     this.input.keyboard?.on("keydown-ESC", () => {
       if (!this.rulesOpen) return;
@@ -99,6 +104,10 @@ export class DungeonScene extends Phaser.Scene {
   private commit(next: GameState, options: { clearChoices?: boolean; save?: boolean } = {}): void {
     const previousPhase = this.state.phase;
     this.state = next;
+    if (next.phase !== "ROOM_REVEAL" || previousPhase !== "ROOM_REVEAL") {
+      this.preparationCandidateId = null;
+      this.preparationTurnSlotId = null;
+    }
     if (next.phase === "LOOT_REWARD" && previousPhase !== "LOOT_REWARD") this.lootPage = 0;
     if (options.clearChoices ?? true) this.clearActionChoice();
     if (options.save ?? next.phase !== "TITLE") {
@@ -368,16 +377,21 @@ export class DungeonScene extends Phaser.Scene {
 
   private renderRoomReveal(): void {
     const room = this.state.currentRoom;
+    if (room?.type === "combat") {
+      this.renderCombatPreparation(room);
+      return;
+    }
+
     this.renderScreenHeading(`Room ${this.state.roomIndex + 1} of ${this.state.playDeck.length}`, "The next card turns face-up.", "DUNGEON PATH");
     this.renderRunProgress(134);
     if (!room) return;
 
     addPanel(this, this.screen, VIEW_WIDTH / 2, 490, 850, 500, {
-      fill: room.type === "combat" ? 0x241923 : 0x202537,
-      stroke: room.type === "combat" ? COLORS.bloodBright : COLORS.arcaneBright,
+      fill: 0x202537,
+      stroke: COLORS.arcaneBright,
       radius: 28
     });
-    addPill(this, this.screen, VIEW_WIDTH / 2, 280, room.tier, room.tier === "SPECIAL" ? "arcane" : room.tier === "BOSS" ? "danger" : "gold", 130);
+    addPill(this, this.screen, VIEW_WIDTH / 2, 280, room.tier, "arcane", 130);
     addText(this, this.screen, VIEW_WIDTH / 2, 324, room.name, {
       size: 46,
       family: FONTS.display,
@@ -388,58 +402,332 @@ export class DungeonScene extends Phaser.Scene {
     });
     addRule(this, this.screen, 430, 396, 1010, COLORS.line, 0.7);
 
-    if (room.type === "combat") {
-      addText(this, this.screen, VIEW_WIDTH / 2, 422, room.tier === "BOSS" ? "BOSS ENCOUNTER" : "COMBAT ENCOUNTER", {
-        size: 14,
-        color: "#e26369",
-        style: "bold",
-        originX: 0.5
-      });
-      room.enemies.forEach((enemy, index) => {
-        const x = VIEW_WIDTH / 2 + (index - (room.enemies.length - 1) / 2) * 220;
-        const circle = this.add.circle(x, 518, 52, 0x562833, 1).setStrokeStyle(2, COLORS.bloodBright);
-        const initials = this.add.text(x, 518, this.enemyInitials(enemy.name), {
-          color: "#ffd2ce",
-          fontFamily: FONTS.display,
-          fontSize: "25px",
-          fontStyle: "bold"
-        }).setOrigin(0.5);
-        this.screen.add([circle, initials]);
-        addText(this, this.screen, x, 584, fitText(enemy.name, 22), {
-          size: 17,
-          family: FONTS.display,
-          style: "bold",
-          originX: 0.5,
-          width: 200,
-          align: "center"
-        });
-        addPill(this, this.screen, x, 625, `${enemy.hp} HP · ${enemy.baseDef} DEF`, "danger", 154);
-      });
-      addText(this, this.screen, VIEW_WIDTH / 2, 684, `${room.rawTurnOrder.length} turn slots · ${room.lootReward} loot reward`, {
-        size: 15,
-        color: "#b9a9b6",
-        originX: 0.5
-      });
-    } else {
-      addText(this, this.screen, VIEW_WIDTH / 2, 438, room.rawText, {
-        size: 22,
-        color: "#d9cbd5",
-        width: 690,
+    addText(this, this.screen, VIEW_WIDTH / 2, 438, room.rawText, {
+      size: 22,
+      color: "#d9cbd5",
+      width: 690,
+      align: "center",
+      originX: 0.5,
+      lineSpacing: 8
+    });
+    addText(this, this.screen, VIEW_WIDTH / 2, 650, "Your party will choose how to resolve this room.", {
+      size: 16,
+      color: "#a98be5",
+      style: "italic",
+      originX: 0.5
+    });
+
+    addButton(this, this.screen, VIEW_WIDTH / 2, 790, 360, 60, "Enter Special Room", () => {
+      this.commit(enterRevealedRoom(this.state));
+    }, { tone: "arcane", fontSize: 19 });
+  }
+
+  private renderCombatPreparation(room: CombatRoomRuntime): void {
+    const roomNumber = this.state.roomIndex + 1;
+    this.renderScreenHeading(
+      `Prepare for ${room.name}`,
+      "Preview every turn, inspect actions, then drag or tap heroes to rearrange A-D.",
+      room.tier === "BOSS" ? "BOSS COMBAT PREPARATION" : `ROOM ${roomNumber} OF ${this.state.playDeck.length} · COMBAT PREPARATION`
+    );
+    this.renderRunProgress(142);
+
+    const projectedOrder = getProjectedTurnOrder(this.state);
+    if (!projectedOrder.some((slot) => slot.id === this.preparationTurnSlotId)) {
+      this.preparationTurnSlotId = projectedOrder.find((slot) => slot.actorType === "enemy")?.id ?? projectedOrder[0]?.id ?? null;
+    }
+    const selectedSlot = projectedOrder.find((slot) => slot.id === this.preparationTurnSlotId) ?? null;
+
+    addPanel(this, this.screen, 230, 252, 350, 150, { fill: 0x241923, stroke: COLORS.bloodBright, radius: 16 });
+    addText(this, this.screen, 76, 191, "ENCOUNTER", { size: 11, color: "#e26369", style: "bold" });
+    addText(this, this.screen, 76, 211, fitText(room.name, 32), {
+      size: 21,
+      family: FONTS.display,
+      style: "bold",
+      width: 308
+    });
+    const enemyCounts = new Map<string, number>();
+    room.enemies.forEach((enemy) => enemyCounts.set(enemy.name, (enemyCounts.get(enemy.name) ?? 0) + 1));
+    const enemySummary = [...enemyCounts.entries()]
+      .map(([name, count]) => count > 1 ? `${count}x ${name}` : name)
+      .join(" · ");
+    addText(this, this.screen, 76, 246, enemySummary, { size: 12, color: "#d9cbd5", width: 308, lineSpacing: 2 });
+    addText(this, this.screen, 76, 298, `${projectedOrder.length} turns · ${room.lootReward} loot reward`, {
+      size: 12,
+      color: "#b9a9b6",
+      style: "bold"
+    });
+
+    addPanel(this, this.screen, 920, 252, 970, 150, { fill: 0x1c1722, stroke: COLORS.line, radius: 16 });
+    this.renderPreparationTurnDetails(room, selectedSlot);
+
+    addText(this, this.screen, 58, 345, "UPCOMING TURN ORDER · SELECT A SLOT TO INSPECT", {
+      size: 11,
+      color: "#d9ad5b",
+      style: "bold"
+    });
+    const timelineGap = 8;
+    const timelineWidth = VIEW_WIDTH - 116;
+    const chipWidth = Math.min(168, (timelineWidth - timelineGap * Math.max(0, projectedOrder.length - 1)) / Math.max(1, projectedOrder.length));
+    const ribbonWidth = chipWidth * projectedOrder.length + timelineGap * Math.max(0, projectedOrder.length - 1);
+    const ribbonStart = (VIEW_WIDTH - ribbonWidth) / 2;
+    projectedOrder.forEach((slot, index) => {
+      const x = ribbonStart + chipWidth / 2 + index * (chipWidth + timelineGap);
+      const selected = slot.id === this.preparationTurnSlotId;
+      const isPlayer = slot.actorType === "player";
+      const actor = isPlayer
+        ? this.state.players.find((player) => player.id === slot.actorId)
+        : room.enemies.find((enemy) => enemy.id === slot.actorId);
+      const action = slot.actorType === "enemy"
+        ? room.enemies.find((enemy) => enemy.id === slot.actorId)?.actions.find((candidate) => candidate.id === slot.actionId)
+        : null;
+      const chip = this.add.container(x, 411);
+      const surface = this.add.rectangle(0, 0, chipWidth, 88, isPlayer ? 0x26362f : 0x42242c)
+        .setStrokeStyle(selected ? 3 : 1, selected ? COLORS.goldBright : isPlayer ? COLORS.mossBright : COLORS.bloodBright, selected ? 1 : 0.7);
+      const indexBadge = this.add.circle(-chipWidth / 2 + 18, -26, 12, selected ? COLORS.gold : COLORS.panelSoft)
+        .setStrokeStyle(1, selected ? COLORS.goldBright : COLORS.line);
+      const indexText = this.add.text(indexBadge.x, indexBadge.y, String(index + 1), {
+        color: "#fff3d7",
+        fontFamily: FONTS.body,
+        fontSize: "10px",
+        fontStyle: "bold"
+      }).setOrigin(0.5);
+      const actorText = this.add.text(0, -15, isPlayer ? `${slot.position} · ${fitText(actor?.name ?? "Hero", 17)}` : fitText(actor?.name ?? "Enemy", 21), {
+        color: isPlayer ? "#d5f6dd" : "#ffd2ce",
+        fontFamily: FONTS.body,
+        fontSize: "12px",
+        fontStyle: "bold",
         align: "center",
-        originX: 0.5,
-        lineSpacing: 8
+        wordWrap: { width: chipWidth - 18, useAdvancedWrap: true }
+      }).setOrigin(0.5);
+      const actionText = this.add.text(0, 20, isPlayer ? "Hero turn" : fitText(action?.name ?? slot.actionId, 24), {
+        color: "#b9a9b6",
+        fontFamily: FONTS.body,
+        fontSize: "10px",
+        align: "center",
+        wordWrap: { width: chipWidth - 16, useAdvancedWrap: true }
+      }).setOrigin(0.5);
+      chip.add([surface, indexBadge, indexText, actorText, actionText]);
+      chip.setSize(chipWidth, 88).setInteractive({ useHandCursor: true });
+      chip.on("pointerover", () => surface.setFillStyle(isPlayer ? 0x315844 : 0x562833));
+      chip.on("pointerout", () => surface.setFillStyle(isPlayer ? 0x26362f : 0x42242c));
+      chip.on("pointerup", () => {
+        this.preparationTurnSlotId = slot.id;
+        this.render();
       });
-      addText(this, this.screen, VIEW_WIDTH / 2, 650, "Your party will choose how to resolve this room.", {
-        size: 16,
-        color: "#a98be5",
-        style: "italic",
-        originX: 0.5
+      this.screen.add(chip);
+    });
+
+    addText(this, this.screen, 58, 478, "FORMATION · DRAG A HERO ONTO ANOTHER POSITION TO SWAP", {
+      size: 11,
+      color: "#d9ad5b",
+      style: "bold"
+    });
+    addText(this, this.screen, VIEW_WIDTH - 58, 478, this.preparationCandidateId
+      ? "Hero selected — tap a destination."
+      : "Touch controls: tap one hero, then tap another.", {
+      size: 11,
+      color: this.preparationCandidateId ? "#f3cf7a" : "#8f7f8c",
+      originX: 1
+    });
+
+    const cardWidth = 300;
+    const cardHeight = 216;
+    const cardY = 625;
+    const frameByPosition = new Map<PlayerPosition, Phaser.GameObjects.Rectangle>();
+    PLAYER_POSITIONS.forEach((position, index) => {
+      const x = 210 + index * 340;
+      const player = this.state.players.find((candidate) => candidate.position === position);
+      const selected = player?.id === this.preparationCandidateId;
+      const frame = this.add.rectangle(x, cardY, cardWidth + 6, cardHeight + 6, 0x0b090d, 0.45)
+        .setStrokeStyle(selected ? 4 : 2, selected ? COLORS.goldBright : COLORS.line, selected ? 1 : 0.65);
+      frameByPosition.set(position, frame);
+      this.screen.add(frame);
+      const zone = this.add.zone(x, cardY, cardWidth, cardHeight).setRectangleDropZone(cardWidth, cardHeight);
+      zone.setData("position", position);
+      this.screen.add(zone);
+    });
+
+    const resetFrames = () => {
+      frameByPosition.forEach((frame, position) => {
+        const player = this.state.players.find((candidate) => candidate.position === position);
+        const selected = player?.id === this.preparationCandidateId;
+        frame.setStrokeStyle(selected ? 4 : 2, selected ? COLORS.goldBright : COLORS.line, selected ? 1 : 0.65);
       });
+    };
+
+    PLAYER_POSITIONS.forEach((position, index) => {
+      const player = this.state.players.find((candidate) => candidate.position === position);
+      if (!player) return;
+      const x = 210 + index * 340;
+      const selected = player.id === this.preparationCandidateId;
+      const stats = getEffectivePlayerStats(this.state, player);
+      const card = this.add.container(x, cardY);
+      const shadow = this.add.rectangle(5, 7, cardWidth, cardHeight, COLORS.shadow, 0.6);
+      const surface = this.add.rectangle(0, 0, cardWidth, cardHeight, selected ? 0x3a3023 : 0x26362f)
+        .setStrokeStyle(selected ? 3 : 2, selected ? COLORS.goldBright : COLORS.mossBright, 1);
+      const positionBadge = this.add.rectangle(-116, -75, 48, 48, selected ? COLORS.gold : COLORS.moss)
+        .setStrokeStyle(2, selected ? COLORS.goldBright : COLORS.mossBright);
+      const positionText = this.add.text(-116, -75, position, {
+        color: "#fff3d7",
+        fontFamily: FONTS.display,
+        fontSize: "26px",
+        fontStyle: "bold"
+      }).setOrigin(0.5);
+      const nameText = this.add.text(-80, -88, fitText(player.name, 24), {
+        color: "#f7eed6",
+        fontFamily: FONTS.display,
+        fontSize: "19px",
+        fontStyle: "bold"
+      });
+      const roleText = this.add.text(-80, -58, player.role ?? "Adventurer", {
+        color: "#b9a9b6",
+        fontFamily: FONTS.body,
+        fontSize: "11px",
+        fontStyle: "italic"
+      });
+      const statText = this.add.text(0, -15, `${player.hp}/${stats.maxHp} HP     ${stats.acc} ACC     ${stats.def} DEF`, {
+        color: "#d5f6dd",
+        fontFamily: FONTS.body,
+        fontSize: "13px",
+        fontStyle: "bold"
+      }).setOrigin(0.5);
+      const abilityText = this.add.text(0, 23, player.abilities.map((ability) => ability.name).join(" · "), {
+        color: "#cbbdc7",
+        fontFamily: FONTS.body,
+        fontSize: "11px",
+        align: "center",
+        wordWrap: { width: cardWidth - 30, useAdvancedWrap: true }
+      }).setOrigin(0.5);
+      const inventoryText = this.add.text(0, 58, `${player.inventory.length}/3 loot · ${player.abilityTokens} ability tokens`, {
+        color: "#9eb7a7",
+        fontFamily: FONTS.body,
+        fontSize: "10px"
+      }).setOrigin(0.5);
+      const instructionText = this.add.text(0, 87, selected ? "SELECTED · TAP A DESTINATION" : "DRAG TO SWAP · TAP TO SELECT", {
+        color: selected ? "#f3cf7a" : "#75b58c",
+        fontFamily: FONTS.body,
+        fontSize: "10px",
+        fontStyle: "bold"
+      }).setOrigin(0.5);
+      card.add([shadow, surface, positionBadge, positionText, nameText, roleText, statText, abilityText, inventoryText, instructionText]);
+      card.setSize(cardWidth, cardHeight).setInteractive({ useHandCursor: true });
+      this.input.setDraggable(card);
+      this.screen.add(card);
+
+      let suppressTap = false;
+      let handledDrop = false;
+      const snapBack = () => {
+        card.setScale(1).setAlpha(1);
+        this.tweens.add({ targets: card, x, y: cardY, duration: 140, ease: "Back.Out" });
+        resetFrames();
+      };
+      card.on("dragstart", () => {
+        suppressTap = true;
+        handledDrop = false;
+        card.setScale(1.025).setAlpha(0.94);
+        this.screen.bringToTop(card);
+      });
+      card.on("drag", (_pointer: Phaser.Input.Pointer, dragX: number, dragY: number) => {
+        card.setPosition(dragX, dragY);
+      });
+      card.on("dragenter", (_pointer: Phaser.Input.Pointer, dropZone: Phaser.GameObjects.Zone) => {
+        const targetPosition = dropZone.getData("position") as PlayerPosition;
+        resetFrames();
+        if (targetPosition !== position) frameByPosition.get(targetPosition)?.setStrokeStyle(4, COLORS.goldBright, 1);
+      });
+      card.on("dragleave", () => resetFrames());
+      card.on("drop", (_pointer: Phaser.Input.Pointer, dropZone: Phaser.GameObjects.Zone) => {
+        handledDrop = true;
+        const targetPosition = dropZone.getData("position") as PlayerPosition;
+        if (targetPosition === position) {
+          snapBack();
+          return;
+        }
+        this.preparationCandidateId = null;
+        this.commit(swapPlayerPosition(this.state, player.id, targetPosition), { clearChoices: false });
+      });
+      card.on("dragend", () => {
+        if (!handledDrop) snapBack();
+        this.time.delayedCall(0, () => { suppressTap = false; });
+      });
+      card.on("pointerup", () => {
+        if (suppressTap) return;
+        this.handlePreparationCardTap(player.id, position);
+      });
+    });
+
+    addButton(this, this.screen, VIEW_WIDTH / 2, 830, 430, 54, "Begin Combat with This Formation", () => {
+      this.preparationCandidateId = null;
+      this.commit(enterRevealedRoom(this.state));
+    }, { tone: "gold", fontSize: 18 });
+  }
+
+  private renderPreparationTurnDetails(room: CombatRoomRuntime, slot: TurnSlot | null): void {
+    addText(this, this.screen, 458, 191, "SELECTED TURN", { size: 11, color: "#d9ad5b", style: "bold" });
+    if (!slot) {
+      addText(this, this.screen, 458, 223, "No turn slots are available for this encounter.", { size: 16, color: "#8f7f8c" });
+      return;
     }
 
-    addButton(this, this.screen, VIEW_WIDTH / 2, 790, 360, 60, room.type === "combat" ? "Enter Combat" : "Enter Special Room", () => {
-      this.commit(enterRevealedRoom(this.state));
-    }, { tone: room.type === "combat" ? "danger" : "arcane", fontSize: 19 });
+    if (slot.actorType === "enemy") {
+      const enemy = room.enemies.find((candidate) => candidate.id === slot.actorId);
+      const action = enemy?.actions.find((candidate) => candidate.id === slot.actionId);
+      if (!enemy || !action) return;
+      const stats = getEffectiveEnemyStats(this.state, enemy);
+      addText(this, this.screen, 458, 212, `${enemy.name} · ${action.name}`, {
+        size: 18,
+        family: FONTS.display,
+        style: "bold",
+        color: "#ffd2ce",
+        width: 910
+      });
+      addPill(this, this.screen, 520, 255, `${enemy.hp}/${enemy.maxHp} HP`, "danger", 108);
+      addPill(this, this.screen, 642, 255, `${stats.acc} ACC`, "danger", 92);
+      addPill(this, this.screen, 748, 255, `${stats.def} DEF`, "danger", 92);
+      if (stats.dmg !== 0) addPill(this, this.screen, 866, 255, `+${stats.dmg} DMG`, "danger", 104);
+      addText(this, this.screen, 458, 282, action.rawText, {
+        size: 12,
+        color: "#d9cbd5",
+        width: 910,
+        lineSpacing: 2
+      });
+      return;
+    }
+
+    const player = this.state.players.find((candidate) => candidate.id === slot.actorId);
+    if (!player) return;
+    const stats = getEffectivePlayerStats(this.state, player);
+    addText(this, this.screen, 458, 212, `${slot.position} · ${player.name}`, {
+      size: 18,
+      family: FONTS.display,
+      style: "bold",
+      color: "#d5f6dd"
+    });
+    addPill(this, this.screen, 520, 255, `${player.hp}/${stats.maxHp} HP`, "success", 108);
+    addPill(this, this.screen, 642, 255, `${stats.acc} ACC`, "success", 92);
+    addPill(this, this.screen, 748, 255, `${stats.def} DEF`, "success", 92);
+    addPill(this, this.screen, 860, 255, `${stats.dmg} DMG`, "success", 104);
+    addText(this, this.screen, 458, 282, `This hero acts whenever position ${slot.position} appears. Swap formation cards below to assign this turn to another hero.`, {
+      size: 12,
+      color: "#d9cbd5",
+      width: 910
+    });
+  }
+
+  private handlePreparationCardTap(playerId: string, targetPosition: PlayerPosition): void {
+    if (!this.preparationCandidateId) {
+      this.preparationCandidateId = playerId;
+      this.render();
+      return;
+    }
+    if (this.preparationCandidateId === playerId) {
+      this.preparationCandidateId = null;
+      this.render();
+      return;
+    }
+    const sourcePlayerId = this.preparationCandidateId;
+    this.preparationCandidateId = null;
+    this.commit(swapPlayerPosition(this.state, sourcePlayerId, targetPosition), { clearChoices: false });
   }
 
   private renderScreenHeading(title: string, subtitle: string, eyebrow: string): void {

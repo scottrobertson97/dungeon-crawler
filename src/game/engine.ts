@@ -199,13 +199,65 @@ export function confirmParty(state: GameState): GameState {
   if (state.selectedCharacterIds.length !== state.content.config.partySize) {
     return appendLog(state, "Select exactly four characters before continuing.", "error");
   }
+  const positionedParty = state.selectedCharacterIds.map((id, index) => ({
+    ...createPlayer(id, state),
+    position: PLAYER_POSITIONS[index] ?? null,
+  }));
+  return revealRoom(
+    appendLog(
+      {
+        ...state,
+        players: positionedParty,
+      },
+      "Party confirmed. Heroes were assigned to positions A-D in selection order.",
+    ),
+    0,
+  );
+}
+
+function hasCompleteFormation(players: PlayerRuntime[]): boolean {
+  const positions = players.map(({ position }) => position);
+  return (
+    players.length === PLAYER_POSITIONS.length &&
+    positions.every((position): position is PlayerPosition =>
+      position !== null && PLAYER_POSITIONS.includes(position),
+    ) &&
+    new Set(positions).size === PLAYER_POSITIONS.length
+  );
+}
+
+export function swapPlayerPosition(
+  state: GameState,
+  playerId: string,
+  targetPosition: PlayerPosition,
+): GameState {
+  if (state.phase !== "ROOM_REVEAL" || state.currentRoom?.type !== "combat") {
+    return appendLog(state, "Formation can only be changed while preparing for a combat room.", "error");
+  }
+  if (!PLAYER_POSITIONS.includes(targetPosition)) {
+    return appendLog(state, `Unknown position: ${targetPosition}.`, "error");
+  }
+  if (!hasCompleteFormation(state.players)) {
+    return appendLog(state, "All four positions must be occupied before heroes can swap.", "error");
+  }
+  const player = state.players.find(({ id }) => id === playerId);
+  if (!player) return appendLog(state, `Unknown player: ${playerId}.`, "error");
+  if (player.position === targetPosition) return state;
+  const target = state.players.find(({ position }) => position === targetPosition);
+  if (!target || player.position === null) {
+    return appendLog(state, `Position ${targetPosition} is not occupied.`, "error");
+  }
+  const sourcePosition = player.position;
   return appendLog(
     {
       ...state,
-      phase: "POSITION_ASSIGNMENT",
-      players: state.selectedCharacterIds.map((id) => createPlayer(id, state)),
+      players: state.players.map((current) => {
+        if (current.id === player.id) return { ...current, position: targetPosition };
+        if (current.id === target.id) return { ...current, position: sourcePosition };
+        return current;
+      }),
     },
-    "Party confirmed. Assign one hero to each position A-D.",
+    `${player.name} and ${target.name} swap positions ${sourcePosition} and ${targetPosition}.`,
   );
 }
 
@@ -322,6 +374,12 @@ function buildTurnOrder(room: CombatRoomRuntime, players: PlayerRuntime[]): Turn
   });
 }
 
+export function getProjectedTurnOrder(state: GameState): TurnSlot[] {
+  return state.currentRoom?.type === "combat"
+    ? buildTurnOrder(state.currentRoom, state.players)
+    : [];
+}
+
 export function getCurrentTurn(state: GameState): TurnSlot | null {
   return state.turn?.order[state.turn.index] ?? null;
 }
@@ -372,7 +430,7 @@ export function enterRevealedRoom(state: GameState): GameState {
     return appendLog(next, `${state.currentRoom.name} awaits the party.`);
   }
 
-  const order = buildTurnOrder(state.currentRoom, state.players);
+  const order = getProjectedTurnOrder(state);
   if (order.length === 0) return appendLog(state, "This combat room has no usable turn slots.", "error");
   const next = appendLog(
     {
@@ -1782,6 +1840,8 @@ export function gameReducer(state: GameState, action: GameAction): GameState {
       return assignPosition(state, action.playerId, action.position);
     case "CONFIRM_POSITIONS":
       return confirmPositions(state);
+    case "SWAP_PLAYER_POSITION":
+      return swapPlayerPosition(state, action.playerId, action.targetPosition);
     case "ENTER_REVEALED_ROOM":
       return enterRevealedRoom(state);
     case "PLAYER_USE_ABILITY":

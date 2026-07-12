@@ -1,5 +1,12 @@
 import { dungeonCrawlContent } from "../data/content";
-import type { DungeonCrawlContent, GameState, RoomDefinition } from "./types";
+import { confirmPositions } from "./engine";
+import { PLAYER_POSITIONS } from "./types";
+import type {
+  DungeonCrawlContent,
+  GameState,
+  PlayerPosition,
+  RoomDefinition,
+} from "./types";
 
 export const SAVE_VERSION = 1 as const;
 export const SAVE_KEY = "dungeon-crawl-save-v1";
@@ -29,6 +36,28 @@ function currentDefinition(content: DungeonCrawlContent, saved: RoomDefinition):
   );
 }
 
+function migrateLegacyPositionAssignment(state: GameState): GameState {
+  if (state.phase !== "POSITION_ASSIGNMENT") return state;
+
+  const claimed = new Set<PlayerPosition>();
+  const normalizedPlayers = state.players.map((player) => {
+    const position = player.position;
+    if (position && PLAYER_POSITIONS.includes(position) && !claimed.has(position)) {
+      claimed.add(position);
+      return player;
+    }
+    return { ...player, position: null };
+  });
+  const unusedPositions = PLAYER_POSITIONS.filter((position) => !claimed.has(position));
+  const completedPlayers = normalizedPlayers.map((player) =>
+    player.position === null
+      ? { ...player, position: unusedPositions.shift() ?? null }
+      : player,
+  );
+
+  return confirmPositions({ ...state, players: completedPlayers });
+}
+
 export function serializeGame(state: GameState): string {
   const envelope: SaveEnvelopeV1 = { saveVersion: SAVE_VERSION, state };
   return JSON.stringify(envelope);
@@ -53,12 +82,13 @@ export function deserializeGame(
   ) {
     throw new Error("Dungeon Crawl save data is incomplete or corrupt.");
   }
-  return {
+  const hydrated: GameState = {
     ...state,
     content,
     playDeck: state.playDeck.map((room) => currentDefinition(content, room)),
     pendingLootRecipientIds: state.pendingLootRecipientIds ?? null,
   };
+  return migrateLegacyPositionAssignment(hydrated);
 }
 
 export function saveGame(state: GameState, storage: StorageLike | null = browserStorage()): boolean {

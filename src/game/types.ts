@@ -391,6 +391,7 @@ export type GameAction =
   | { type: "CONFIRM_PARTY" }
   | { type: "ASSIGN_POSITION"; playerId: string; position: PlayerPosition }
   | { type: "CONFIRM_POSITIONS" }
+  | { type: "SWAP_PLAYER_POSITION"; playerId: string; targetPosition: PlayerPosition }
   | { type: "ENTER_REVEALED_ROOM" }
   | { type: "PLAYER_USE_ABILITY"; choice: PlayerAbilityChoice; rolls?: number[] }
   | { type: "RESOLVE_ENEMY_TURN"; rolls?: number[] }
