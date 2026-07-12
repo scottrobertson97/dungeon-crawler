@@ -5,14 +5,19 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta
       name="description"
-      content="Dungeon Crawl, a local hot-seat tabletop dungeon crawler built with Phaser."
+      content="Dungeon Crawl is a local cooperative tabletop-inspired adventure for one player or a shared-screen party."
     />
-    <link rel="icon" type="image/svg+xml" href="./favicon.svg" />
+    <link rel="icon" type="image/svg+xml" href="%BASE_URL%favicon.svg" />
     <title>Dungeon Crawl</title>
   </head>
   <body>
-    <div id="game"></div>
-    <main id="ui-root" aria-live="polite"></main>
+    <div id="app">
+      <main id="game-shell" aria-label="Dungeon Crawl game">
+        <div id="game" aria-label="Dungeon board"></div>
+        <div id="ui-root" aria-live="polite"></div>
+      </main>
+    </div>
+    <noscript>Dungeon Crawl requires JavaScript to run.</noscript>
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>

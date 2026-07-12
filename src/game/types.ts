@@ -1,4 +1,8 @@
 export type PlayerPosition = "A" | "B" | "C" | "D";
+
+export const PLAYER_POSITIONS: readonly PlayerPosition[] = ["A", "B", "C", "D"];
+
+export type RoomTier = "A" | "B" | "BOSS" | "SPECIAL";
 export type GamePhase =
   | "TITLE"
   | "PARTY_SELECT"
@@ -10,230 +14,387 @@ export type GamePhase =
   | "VICTORY"
   | "DEFEAT";
 
-export type StatName = "acc" | "def" | "dmg" | "maxHp";
-export type LogTone = "normal" | "good" | "warn" | "danger";
+export type StatName = "acc" | "def" | "dmg";
+export type LootKind = "equipment" | "consumable" | "item";
 
-export type StatBlockDefinition = {
+export type EffectType =
+  | "attackEnemy"
+  | "attackEnemies"
+  | "attackAllPlayers"
+  | "attackPlayersByPosition"
+  | "attackHighestHpPlayers"
+  | "doubleBlockAllPlayers"
+  | "unblockableDamageAllPlayers"
+  | "damageAllPlayersByCounter"
+  | "damageEnemy"
+  | "splitDamage"
+  | "healSelf"
+  | "healAlly"
+  | "healAllAllies"
+  | "splitHeal"
+  | "healEnemiesByTag"
+  | "healPartyToMax"
+  | "applyModifier"
+  | "applyModifierToPositions"
+  | "applyModifierAllPlayers"
+  | "applyModifierToLastTargets"
+  | "applyDot"
+  | "addCounter"
+  | "conditionalCounterAttackAllPlayers"
+  | "forceDiscardLootIfHit"
+  | "increaseAbilityDamage"
+  | "skipNextAction"
+  | "untargetableUntilOthersDead"
+  | "onDeathDamageAllPlayers"
+  | "passiveRevive"
+  | "vendorTrade"
+  | "witchPotionTrade"
+  | "returnToBottomOfLootDeck"
+  | "rerollOncePerRoom"
+  | "reactionModifier";
+
+/**
+ * The seed is deliberately data-driven. Known fields are typed for engine use,
+ * while the index signature lets future seed content fail gracefully in the
+ * effect dispatcher instead of failing to load.
+ */
+export interface EffectDefinition {
+  type?: EffectType | (string & {});
+  target?: string;
+  targetCount?: number;
+  targetPosition?: PlayerPosition;
+  positions?: PlayerPosition[];
+  targetCountLimit?: number;
+  enemyId?: string;
+  abilityId?: string;
+  stat?: StatName;
+  amount?: number;
+  damage?: number;
+  totalDamage?: number;
+  totalHealing?: number;
+  accuracyModifier?: number;
+  duration?: string;
+  timing?: string;
+  stacking?: "stack" | "noStack";
+  oncePerEncounter?: boolean;
+  maxDamage?: number;
+  counter?: string;
+  threshold?: number;
+  consume?: number;
+  damagePerCounter?: number;
+  damagePerHit?: number;
+  onOneHit?: EffectDefinition[];
+  onTwoHits?: EffectDefinition[];
+  delayTurns?: number;
+  tag?: string;
+  drawCount?: number;
+  drawUntilTag?: string;
+  hpCost?: number;
+  tradeCost?: { lootCards: number };
+  usesPerRoom?: number;
+  roll?: number[];
+  name?: string;
+  rawText?: string;
+  [key: string]: unknown;
+}
+
+export interface StatDefinition {
   maxHp: number;
   acc: number;
   def: number;
-};
+}
 
-export type EffectDefinition = {
-  type?: string;
-  [key: string]: unknown;
-};
-
-export type AbilityDefinition = {
+export interface AbilityDefinition {
   id: string;
   name: string;
   rawText: string;
   effects: EffectDefinition[];
   implementationNotes?: string;
-};
+}
 
-export type CharacterDefinition = {
+export interface CharacterDefinition {
   id: string;
   name: string;
   role?: string;
-  stats: StatBlockDefinition;
+  stats: StatDefinition;
   abilities: AbilityDefinition[];
-};
+}
 
-export type EnemyActionDefinition = {
+export interface EnemyActionDefinition {
   id: string;
   name: string;
   rawText: string;
   effects: EffectDefinition[];
   implementationNotes?: string;
-};
+}
 
-export type PassiveDefinition = {
-  type: string;
-  [key: string]: unknown;
-};
-
-export type EnemyDefinition = {
+export interface EnemyDefinition {
   id: string;
   name: string;
-  stats: StatBlockDefinition;
+  stats: StatDefinition;
   actions: EnemyActionDefinition[];
-  tags?: string[];
-  passives?: PassiveDefinition[];
-};
+  passives?: EffectDefinition[];
+  counters?: Record<string, number>;
+}
 
-export type CombatRoomDefinition = {
+export interface CombatRoomDefinition {
   id: string;
   name: string;
-  tier: "A" | "B" | "BOSS";
+  tier: Exclude<RoomTier, "SPECIAL">;
   type: "combat";
   lootReward: number;
   turnOrder: string[];
   enemies: EnemyDefinition[];
-};
+  sourceNote?: string;
+}
 
-export type TreasureOutcomeDefinition = {
-  roll: number[];
-  name: string;
-  rawText: string;
-};
-
-export type SpecialRoomDefinition = {
+export interface SpecialRoomDefinition {
   id: string;
   name: string;
+  tier: "SPECIAL";
   type: "special";
+  lootReward: 0;
   rawText: string;
-  effects: Array<EffectDefinition | TreasureOutcomeDefinition>;
+  effects: EffectDefinition[];
   implementationNotes?: string;
-};
+}
 
-export type LootCardDefinition = {
+export type RoomDefinition = CombatRoomDefinition | SpecialRoomDefinition;
+
+export interface LootStatBonus {
+  maxHp?: number;
+  acc?: number;
+  def?: number;
+  dmg?: number;
+}
+
+export interface LootCardDefinition {
   id: string;
   name: string;
-  kind: "equipment" | "consumable" | "item";
+  kind: LootKind;
   rawText: string;
-  statBonus?: Partial<Record<StatName, number>>;
   tags?: string[];
+  statBonus?: LootStatBonus;
   effects?: EffectDefinition[];
-};
+}
 
-export type DungeonContent = {
+export interface DungeonCrawlContent {
   metadata: {
     gameTitle: string;
-    sourceNotes?: string[];
-    assumptions?: string[];
+    sourceNotes: string[];
+    assumptions: string[];
   };
   config: {
-    partySize: 4;
+    partySize: number;
     maxHpCap: number;
-    dice: {
-      combatDie: "d6";
-    };
-    playDeckRecipe: Array<"A" | "B" | "SPECIAL" | "BOSS">;
+    dice: { combatDie: string };
+    playDeckRecipe: RoomTier[];
   };
   characters: CharacterDefinition[];
   rooms: CombatRoomDefinition[];
   specialRooms: SpecialRoomDefinition[];
   starterLoot: LootCardDefinition[];
-};
+}
 
-export type DeckEntry =
-  | { kind: "combat"; id: string }
-  | { kind: "special"; id: string };
+export interface RngState {
+  seed: string;
+  state: number;
+  draws: number;
+}
 
-export type PlayerRuntime = {
+export interface AbilityRuntimeState {
+  usedThisEncounter?: boolean;
+  damageBonus?: number;
+}
+
+export interface PlayerRuntime {
   id: string;
   characterId: string;
   name: string;
   role?: string;
-  position?: PlayerPosition;
-  maxHp: number;
+  position: PlayerPosition | null;
   hp: number;
-  acc: number;
-  def: number;
-  lootIds: string[];
+  maxHp: number;
+  baseMaxHp: number;
+  baseAcc: number;
+  baseDef: number;
+  isDead: boolean;
+  inventory: LootCardRuntime[];
+  equippedLootIds: string[];
+  abilities: AbilityDefinition[];
+  abilityState: Record<string, AbilityRuntimeState>;
   abilityTokens: number;
-  dead: boolean;
-  lootedOnDeath: boolean;
-  skipNextAction: boolean;
+  skipActions: number;
   pendingReviveTurns: number | null;
-  oncePerEncounterUsed: string[];
-  usedLootThisRoom: string[];
-  abilityDamageBonusById: Record<string, number>;
-};
+}
 
-export type DamageOverTime = {
+export interface EnemyRuntime {
   id: string;
-  sourceId: string;
-  damage: number;
-  timing: "enemyTurnStart";
-};
-
-export type EnemyRuntime = {
-  id: string;
-  name: string;
-  maxHp: number;
-  hp: number;
-  acc: number;
-  def: number;
-  tags: string[];
-  actions: EnemyActionDefinition[];
-  passives: PassiveDefinition[];
-  dead: boolean;
-  passiveTriggered: string[];
-  counters: Record<string, number>;
-  dots: DamageOverTime[];
-  skipNextAction: boolean;
-};
-
-export type RuntimeRoom = {
   definitionId: string;
   name: string;
-  tier: "A" | "B" | "BOSS";
+  hp: number;
+  maxHp: number;
+  baseAcc: number;
+  baseDef: number;
+  isDead: boolean;
+  counters: Record<string, number>;
+  actions: EnemyActionDefinition[];
+  passives: EffectDefinition[];
+  deathPassivesResolved: boolean;
+}
+
+export type LootCardRuntime = LootCardDefinition & { instanceId: string };
+
+export interface CombatRoomRuntime {
+  id: string;
+  definitionId: string;
+  name: string;
+  tier: Exclude<RoomTier, "SPECIAL">;
   type: "combat";
   lootReward: number;
-  turnOrder: string[];
+  rawTurnOrder: string[];
   enemies: EnemyRuntime[];
-};
+}
 
-export type ModifierRuntime = {
+export interface SpecialRoomRuntime {
+  id: string;
+  definitionId: string;
+  name: string;
+  tier: "SPECIAL";
+  type: "special";
+  lootReward: 0;
+  rawText: string;
+  effects: EffectDefinition[];
+}
+
+export type RuntimeRoom = CombatRoomRuntime | SpecialRoomRuntime;
+
+export interface PlayerTurnSlot {
+  id: string;
+  actorType: "player";
+  actorId: string;
+  position: PlayerPosition;
+  raw: string;
+}
+
+export interface EnemyTurnSlot {
+  id: string;
+  actorType: "enemy";
+  actorId: string;
+  actionId: string;
+  raw: string;
+}
+
+export type TurnSlot = PlayerTurnSlot | EnemyTurnSlot;
+
+export interface TurnState {
+  index: number;
+  order: TurnSlot[];
+  round: number;
+  actionsResolved: number;
+}
+
+export type ModifierDuration =
+  | { type: "targetActions"; remaining: number }
+  | { type: "untilSourceNextTurn" }
+  | { type: "rounds"; remaining: number }
+  | { type: "enemyRound" }
+  | { type: "room" };
+
+export interface TimedModifier {
   id: string;
   sourceId: string;
-  targetKind: "player" | "enemy";
+  sourceType: "player" | "enemy" | "loot";
   targetId: string;
-  stat: "acc" | "def" | "dmg";
+  stat: StatName;
   amount: number;
-  duration: "nextAction" | "nextTurn" | "nextBlock" | "oneTurn" | "oneRound" | "threeTurns" | "room";
-  remainingTurns?: number;
-  stacking?: "stack" | "noStack";
-  label: string;
-};
+  duration: ModifierDuration;
+  stacking: "stack" | "noStack";
+  effectKey: string;
+}
 
-export type GameLogEntry = {
+export interface DamageOverTime {
   id: string;
-  text: string;
-  tone: LogTone;
-};
+  sourceId: string;
+  targetId: string;
+  damage: number;
+  timing: "enemyTurnStart";
+}
 
-export type VendorState = {
-  drawIds: string[];
-  selectedPaymentIds: string[];
-  selectedTakeId: string | null;
-  selectedRecipientId: string | null;
-};
+export interface GameLogEntry {
+  id: number;
+  level: "info" | "roll" | "warning" | "error";
+  message: string;
+}
 
-export type GameState = {
+export interface SpecialRoomState {
+  resolved: boolean;
+  vendorOffer: LootCardRuntime[];
+  result?: string;
+}
+
+export interface GameState {
+  stateVersion: 1;
   phase: GamePhase;
-  rngSeed: string;
-  rngState: number;
+  content: DungeonCrawlContent;
+  rng: RngState;
   selectedCharacterIds: string[];
-  selectedPlayers: PlayerRuntime[];
-  playDeck: DeckEntry[];
-  completedRooms: string[];
-  roomNumber: number;
+  players: PlayerRuntime[];
+  playDeck: RoomDefinition[];
+  roomIndex: number;
+  completedRoomIds: string[];
   currentRoom: RuntimeRoom | null;
-  currentSpecialId: string | null;
-  turn: {
-    index: number;
-    round: number;
-  } | null;
-  modifiers: ModifierRuntime[];
-  lootDeck: string[];
-  lootDiscard: string[];
-  pendingLootReward: string[];
-  vendor: VendorState | null;
-  pendingPlayerReroll: { playerId: string; lootId: string } | null;
-  lastEnemyActionHits: string[];
+  turn: TurnState | null;
+  modifiers: TimedModifier[];
+  dots: DamageOverTime[];
+  lootDeck: LootCardRuntime[];
+  lootDiscard: LootCardRuntime[];
+  pendingLootReward: LootCardRuntime[];
+  pendingLootRecipientIds: string[] | null;
+  specialRoomState: SpecialRoomState | null;
+  pendingRerollPlayerId: string | null;
+  pendingBlockBonuses: Record<string, number>;
+  lootUsesThisRoom: Record<string, number>;
   log: GameLogEntry[];
-};
+  nextRuntimeId: number;
+  nextLogId: number;
+}
 
-export type CurrentTurn =
-  | { kind: "player"; position: PlayerPosition; player: PlayerRuntime | null; label: string }
-  | {
-      kind: "enemy";
-      enemyId: string;
-      actionId: string;
-      enemy: EnemyRuntime | null;
-      action: EnemyActionDefinition | null;
-      label: string;
-    };
+export interface EffectivePlayerStats {
+  maxHp: number;
+  acc: number;
+  def: number;
+  dmg: number;
+}
+
+export interface EffectiveEnemyStats {
+  acc: number;
+  def: number;
+  dmg: number;
+}
+
+export interface PlayerAbilityChoice {
+  playerId: string;
+  abilityId: string;
+  targetIds?: string[];
+  allocation?: Record<string, number>;
+}
+
+export interface VendorPayment {
+  playerId: string;
+  lootInstanceId: string;
+}
+
+export type GameAction =
+  | { type: "START_NEW_GAME"; seed?: string }
+  | { type: "TOGGLE_CHARACTER"; characterId: string }
+  | { type: "CONFIRM_PARTY" }
+  | { type: "ASSIGN_POSITION"; playerId: string; position: PlayerPosition }
+  | { type: "CONFIRM_POSITIONS" }
+  | { type: "ENTER_REVEALED_ROOM" }
+  | { type: "PLAYER_USE_ABILITY"; choice: PlayerAbilityChoice; rolls?: number[] }
+  | { type: "RESOLVE_ENEMY_TURN"; rolls?: number[] }
+  | { type: "ASSIGN_LOOT"; lootInstanceId: string; playerId: string | null }
+  | { type: "CONTINUE_AFTER_LOOT" }
+  | { type: "CONTINUE_AFTER_SPECIAL_ROOM" }
+  | { type: "LOAD_GAME"; state: GameState };

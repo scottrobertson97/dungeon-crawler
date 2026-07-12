@@ -1,39 +1,53 @@
+import type { RngState } from "./types";
+
+const UINT32_RANGE = 0x1_0000_0000;
+const NON_ZERO_FALLBACK = 0x9e37_79b9;
+
+/** Stable FNV-1a hash so a human-readable seed produces the same run everywhere. */
 export function hashSeed(seed: string): number {
-  let hash = 2166136261;
+  let hash = 0x811c_9dc5;
   for (let index = 0; index < seed.length; index += 1) {
     hash ^= seed.charCodeAt(index);
-    hash = Math.imul(hash, 16777619);
+    hash = Math.imul(hash, 0x0100_0193);
   }
-  return hash >>> 0 || 1;
+  const unsigned = hash >>> 0;
+  return unsigned === 0 ? NON_ZERO_FALLBACK : unsigned;
 }
 
-export function nextRandomState(state: number): number {
-  return (Math.imul(state, 1664525) + 1013904223) >>> 0;
+export function createRng(seed = "dungeon-crawl"): RngState {
+  return { seed, state: hashSeed(seed), draws: 0 };
 }
 
-export function randomFloat(state: number): { state: number; value: number } {
-  const next = nextRandomState(state);
+/** Pure xorshift32 step. */
+export function nextRandom(rng: RngState): { rng: RngState; value: number } {
+  let value = rng.state >>> 0;
+  value ^= value << 13;
+  value ^= value >>> 17;
+  value ^= value << 5;
+  value >>>= 0;
+  if (value === 0) value = NON_ZERO_FALLBACK;
   return {
-    state: next,
-    value: next / 0x100000000
+    rng: { ...rng, state: value, draws: rng.draws + 1 },
+    value: value / UINT32_RANGE,
   };
 }
 
-export function randomInt(state: number, min: number, max: number): { state: number; value: number } {
-  const result = randomFloat(state);
-  return {
-    state: result.state,
-    value: Math.floor(result.value * (max - min + 1)) + min
-  };
+export function rollD6(rng: RngState): { rng: RngState; roll: number } {
+  const result = nextRandom(rng);
+  return { rng: result.rng, roll: Math.floor(result.value * 6) + 1 };
 }
 
-export function shuffleWithState<T>(items: T[], state: number): { state: number; items: T[] } {
-  const copy = [...items];
-  let nextState = state;
-  for (let index = copy.length - 1; index > 0; index -= 1) {
-    const roll = randomInt(nextState, 0, index);
-    nextState = roll.state;
-    [copy[index], copy[roll.value]] = [copy[roll.value], copy[index]];
+export function shuffleWithRng<T>(
+  items: readonly T[],
+  rng: RngState,
+): { items: T[]; rng: RngState } {
+  const shuffled = [...items];
+  let nextRng = rng;
+  for (let index = shuffled.length - 1; index > 0; index -= 1) {
+    const result = nextRandom(nextRng);
+    nextRng = result.rng;
+    const swapIndex = Math.floor(result.value * (index + 1));
+    [shuffled[index], shuffled[swapIndex]] = [shuffled[swapIndex], shuffled[index]];
   }
-  return { state: nextState, items: copy };
+  return { items: shuffled, rng: nextRng };
 }

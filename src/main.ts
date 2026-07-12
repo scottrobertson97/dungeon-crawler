@@ -1,17 +1,31 @@
+import Phaser from "phaser";
+
 import "./styles.css";
-import { dungeonCrawlContent } from "./data/content";
-import { createGame } from "./phaser/createGame";
-import { createDungeonApp, loadInitialState } from "./ui/app";
+import { DungeonScene } from "./phaser/scenes/DungeonScene";
+import { VIEW_HEIGHT, VIEW_WIDTH } from "./phaser/ui";
 
-const gameRoot = document.querySelector<HTMLElement>("#game");
-const uiRoot = document.querySelector<HTMLElement>("#ui-root");
+const config: Phaser.Types.Core.GameConfig = {
+  type: Phaser.AUTO,
+  parent: "game",
+  width: VIEW_WIDTH,
+  height: VIEW_HEIGHT,
+  backgroundColor: "#0d0b14",
+  scene: [DungeonScene],
+  scale: {
+    mode: Phaser.Scale.FIT,
+    autoCenter: Phaser.Scale.CENTER_BOTH,
+    width: VIEW_WIDTH,
+    height: VIEW_HEIGHT
+  },
+  render: {
+    antialias: true,
+    pixelArt: false,
+    roundPixels: false
+  }
+};
 
-if (!gameRoot || !uiRoot) {
-  throw new Error("Dungeon Crawl mount points are missing.");
-}
+const game = new Phaser.Game(config);
 
-const initialState = loadInitialState(dungeonCrawlContent);
-(window as Window & { __DUNGEON_CRAWL_STATE__?: typeof initialState }).__DUNGEON_CRAWL_STATE__ = initialState;
-
-createGame("game");
-createDungeonApp(uiRoot, dungeonCrawlContent, initialState);
+window.addEventListener("beforeunload", () => {
+  game.destroy(true);
+});

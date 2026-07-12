@@ -1,389 +1,657 @@
 import { describe, expect, it } from "vitest";
-import { dungeonCrawlContent } from "../data/content";
+import { dungeonCrawlContent, SUPPORTED_EFFECT_TYPES, validateDungeonCrawlContent } from "../data/content";
 import {
+  advanceTurn,
   assignLoot,
   assignPosition,
-  completeVendorTrade,
   confirmParty,
   confirmPositions,
   continueAfterLoot,
+  continueAfterSpecialRoom,
+  createTitleState,
   enterRevealedRoom,
   getCurrentTurn,
-  getPlayerEffectiveStats,
-  isEnemyTargetable,
-  resolveHealingSpring,
+  getEffectiveEnemyStats,
+  getEffectivePlayerStats,
+  getTargetableEnemies,
+  leaveVendor,
   resolveEnemyTurn,
+  resolveHealingSpring,
+  resolvePlayerAttackRoll,
+  resolvePlayerBlockRoll,
   resolveTreasureRoom,
-  resolveWitchTrade,
+  resolveVendorTrade,
+  resolveWitchRoom,
   startNewGame,
-  startSpecificCombatRoom,
   toggleCharacterSelection,
-  transferPlayerLoot,
-  useLootCard,
-  usePlayerAbility
+  useLoot,
+  usePlayerAbility,
 } from "./engine";
-import { checkPlayerAttackRoll, checkPlayerBlockRoll } from "./rules";
-import type { GameState } from "./types";
+import { createRng, shuffleWithRng } from "./rng";
+import { deserializeGame, serializeGame } from "./save";
+import type {
+  GameState,
+  PlayerPosition,
+  RoomDefinition,
+  TurnSlot,
+} from "./types";
 
-describe("combat dice rules", () => {
-  it("player attack misses on natural 1 and hits on natural 6", () => {
-    expect(checkPlayerAttackRoll(1, 99, 4).success).toBe(false);
-    expect(checkPlayerAttackRoll(6, 0, 99).success).toBe(true);
+const defaultParty = [
+  "avg-guy",
+  "hayden-brockensword",
+  "tim-grandmaster-wizard",
+  "sten-the-casual",
+];
+
+function definition(roomId: string): RoomDefinition {
+  const found = [...dungeonCrawlContent.rooms, ...dungeonCrawlContent.specialRooms].find(({ id }) => id === roomId);
+  if (!found) throw new Error(`Missing test room ${roomId}.`);
+  return found;
+}
+
+function setupRoom(
+  roomId: string,
+  party = defaultParty,
+  seed = `test-${roomId}`,
+): GameState {
+  let state = startNewGame(createTitleState(), seed);
+  for (const characterId of party) state = toggleCharacterSelection(state, characterId);
+  state = confirmParty(state);
+  (["A", "B", "C", "D"] as PlayerPosition[]).forEach((position, index) => {
+    state = assignPosition(state, state.players[index].id, position);
+  });
+  state = { ...state, playDeck: [definition(roomId)] };
+  state = confirmPositions(state);
+  return enterRevealedRoom(state);
+}
+
+function atTurn(state: GameState, predicate: (slot: TurnSlot) => boolean): GameState {
+  if (!state.turn) throw new Error("Expected combat turn state.");
+  const index = state.turn.order.findIndex(predicate);
+  if (index < 0) throw new Error("Expected turn slot was not found.");
+  return { ...state, turn: { ...state.turn, index } };
+}
+
+function updateEnemyHp(state: GameState, definitionId: string, hp: number): GameState {
+  if (state.currentRoom?.type !== "combat") throw new Error("Expected combat room.");
+  return {
+    ...state,
+    currentRoom: {
+      ...state.currentRoom,
+      enemies: state.currentRoom.enemies.map((enemy) =>
+        enemy.definitionId === definitionId ? { ...enemy, hp, isDead: hp <= 0 } : enemy,
+      ),
+    },
+  };
+}
+
+describe("deterministic setup and phase flow", () => {
+  it("validates every seeded turn reference and all 34 structured effect types", () => {
+    expect(() => validateDungeonCrawlContent(dungeonCrawlContent)).not.toThrow();
+    expect(SUPPORTED_EFFECT_TYPES.size).toBe(34);
   });
 
-  it("player attack ties hit", () => {
-    expect(checkPlayerAttackRoll(3, 1, 4).success).toBe(true);
+  it("builds the same six-room recipe and loot order from the same seed", () => {
+    const first = startNewGame(createTitleState(), "repeatable");
+    const second = startNewGame(createTitleState(), "repeatable");
+    expect(first.playDeck.map(({ id }) => id)).toEqual(second.playDeck.map(({ id }) => id));
+    expect(first.playDeck.map(({ tier }) => tier)).toEqual(["A", "A", "SPECIAL", "B", "B", "BOSS"]);
+    expect(first.lootDeck.map(({ instanceId }) => instanceId)).toEqual(second.lootDeck.map(({ instanceId }) => instanceId));
+    expect(first.lootDeck).toHaveLength(32);
   });
 
-  it("block ties succeed and natural edges override stats", () => {
-    expect(checkPlayerBlockRoll(3, 4, 7).success).toBe(true);
-    expect(checkPlayerBlockRoll(1, 99, 7).success).toBe(false);
-    expect(checkPlayerBlockRoll(6, 0, 99).success).toBe(true);
+  it("uses a stable pure shuffle without mutating the input", () => {
+    const source = [1, 2, 3, 4, 5];
+    const first = shuffleWithRng(source, createRng("cards"));
+    const second = shuffleWithRng(source, createRng("cards"));
+    expect(first.items).toEqual(second.items);
+    expect(source).toEqual([1, 2, 3, 4, 5]);
+  });
+
+  it("requires four unique positions before revealing a room", () => {
+    let state = startNewGame(createTitleState(), "positions");
+    for (const id of defaultParty) state = toggleCharacterSelection(state, id);
+    state = confirmParty(state);
+    expect(state.phase).toBe("POSITION_ASSIGNMENT");
+    state = assignPosition(state, state.players[0].id, "A");
+    expect(confirmPositions(state).phase).toBe("POSITION_ASSIGNMENT");
+  });
+
+  it("creates unique runtime enemy and turn-slot ids", () => {
+    const state = setupRoom("room-1");
+    expect(state.currentRoom?.type).toBe("combat");
+    const ids = state.turn!.order.map(({ id }) => id);
+    expect(new Set(ids).size).toBe(ids.length);
+    const giantSlots = state.turn!.order.filter((slot) => slot.actorType === "enemy");
+    expect(new Set(giantSlots.map(({ actorId }) => actorId)).size).toBe(1);
   });
 });
 
-describe("Dungeon Crawl engine", () => {
-  it("builds a six-room deck and enters combat from a selected party", () => {
-    const state = startReadyRun();
-    expect(state.playDeck.length + (state.currentRoom ? 1 : 0) + (state.currentSpecialId ? 1 : 0)).toBe(6);
-    const combat = enterRevealedRoom(state, dungeonCrawlContent);
-    expect(combat.phase).toBe("COMBAT");
-    expect(getCurrentTurn(combat)).toBeTruthy();
+describe("combat math", () => {
+  it("makes natural 1 fail, natural 6 succeed, and ties favor the player", () => {
+    expect(resolvePlayerAttackRoll(1, 99, 2).success).toBe(false);
+    expect(resolvePlayerAttackRoll(6, -99, 20).success).toBe(true);
+    expect(resolvePlayerAttackRoll(3, 1, 4).success).toBe(true);
+    expect(resolvePlayerBlockRoll(1, 99, 2).success).toBe(false);
+    expect(resolvePlayerBlockRoll(6, -99, 20).success).toBe(true);
+    expect(resolvePlayerBlockRoll(3, 2, 5).success).toBe(true);
   });
 
-  it("completes Room 1 and creates a loot reward when the Giant dies", () => {
-    let state = startRoomOne();
-    const player = state.selectedPlayers.find((candidate) => candidate.position === "A");
-    const giant = state.currentRoom?.enemies[0];
-    expect(player).toBeTruthy();
-    expect(giant).toBeTruthy();
-    if (!player || !giant) {
-      throw new Error("test setup failed");
-    }
-    state.turn = { index: state.currentRoom!.turnOrder.indexOf("player:A"), round: 1 };
-    giant.hp = 1;
-    state = usePlayerAbility(state, dungeonCrawlContent, player.id, "lights-slice", [giant.id]);
-    expect(["LOOT_REWARD", "COMBAT"]).toContain(state.phase);
-    if (state.phase === "LOOT_REWARD") {
-      expect(state.pendingLootReward.length).toBeGreaterThan(0);
-    }
+  it("kills an enemy, completes the room, revives allies, and draws loot", () => {
+    let state = setupRoom("room-1");
+    state = atTurn(state, (slot) => slot.actorType === "player" && slot.position === "A");
+    state = updateEnemyHp(state, "giant", 4);
+    const enemyId = getTargetableEnemies(state)[0].id;
+    state = usePlayerAbility(state, { playerId: state.players[0].id, abilityId: "sword-attack", targetIds: [enemyId] }, [6]);
+    expect(state.phase).toBe("LOOT_REWARD");
+    expect(state.pendingLootReward).toHaveLength(2);
+    expect(state.currentRoom?.type === "combat" && state.currentRoom.enemies[0].isDead).toBe(true);
   });
 
-  it("enforces the three-card loot cap", () => {
-    let state = startReadyRun();
-    const player = state.selectedPlayers[0];
-    state.phase = "LOOT_REWARD";
-    state.pendingLootReward = ["well-made-chainmail", "keen-blade", "archers-gloves", "heart-amulet"];
-    state = assignLoot(state, dungeonCrawlContent, "well-made-chainmail", player.id);
-    state = assignLoot(state, dungeonCrawlContent, "keen-blade", player.id);
-    state = assignLoot(state, dungeonCrawlContent, "archers-gloves", player.id);
-    state = assignLoot(state, dungeonCrawlContent, "heart-amulet", player.id);
-    expect(state.selectedPlayers[0].lootIds).toHaveLength(3);
-    expect(state.pendingLootReward).toContain("heart-amulet");
+  it("redirects dead position targets without double-hitting", () => {
+    let state = setupRoom("room-1");
+    const [a, b, c, d] = state.players;
+    state = {
+      ...state,
+      players: state.players.map((player) => (player.id === a.id ? { ...player, hp: 0, isDead: true } : player)),
+    };
+    state = atTurn(state, (slot) => slot.actorType === "enemy" && slot.actionId === "1");
+    const before = Object.fromEntries(state.players.map((player) => [player.id, player.hp]));
+    state = resolveEnemyTurn(state, [1, 1]);
+    expect(state.players.find(({ id }) => id === b.id)!.hp).toBe(before[b.id] - 4);
+    expect(state.players.find(({ id }) => id === c.id)!.hp).toBe(before[c.id] - 4);
+    expect(state.players.find(({ id }) => id === d.id)!.hp).toBe(before[d.id]);
   });
 
-  it("healing spring restores living and fallen party members", () => {
-    let state = startReadyRun();
-    state.phase = "SPECIAL_ROOM";
-    state.currentSpecialId = "healing-spring";
-    state.selectedPlayers[0].hp = 1;
-    state.selectedPlayers[1].hp = 0;
-    state.selectedPlayers[1].dead = true;
-    state = resolveHealingSpring(state, dungeonCrawlContent);
-    expect(state.selectedPlayers[0].hp).toBe(state.selectedPlayers[0].maxHp);
-    expect(state.selectedPlayers[1].dead).toBe(false);
-    expect(state.selectedPlayers[1].hp).toBe(state.selectedPlayers[1].maxHp);
+  it("returns a dead hero's loot to the bottom of the deck", () => {
+    let state = setupRoom("room-1");
+    const player = state.players[0];
+    const [card, ...deck] = state.lootDeck;
+    state = {
+      ...state,
+      lootDeck: deck,
+      players: state.players.map((current) =>
+        current.id === player.id
+          ? { ...current, hp: 1, inventory: [card], equippedLootIds: [card.instanceId] }
+          : current,
+      ),
+    };
+    state = atTurn(state, (slot) => slot.actorType === "enemy" && slot.actionId === "1");
+    state = resolveEnemyTurn(state, [1, 6]);
+    expect(state.players.find(({ id }) => id === player.id)!.inventory).toEqual([]);
+    expect(state.lootDeck.at(-1)?.instanceId).toBe(card.instanceId);
   });
 
-  it("treasure room tracks ability tokens or pending loot", () => {
-    let state = startReadyRun();
-    state.phase = "SPECIAL_ROOM";
-    state.currentSpecialId = "treasure-room";
-    state = resolveTreasureRoom(state, dungeonCrawlContent);
-    const tokenTotal = state.selectedPlayers.reduce((sum, player) => sum + player.abilityTokens, 0);
-    expect(tokenTotal + state.pendingLootReward.length).toBeGreaterThan(0);
+  it("revives Sten after his skipped turn when the party still lives", () => {
+    let state = setupRoom("room-1", ["sten-the-casual", "avg-guy", "hayden-brockensword", "tim-grandmaster-wizard"]);
+    const sten = state.players[0];
+    state = { ...state, players: state.players.map((player) => (player.id === sten.id ? { ...player, hp: 1 } : player)) };
+    state = atTurn(state, (slot) => slot.actorType === "enemy" && slot.actionId === "1");
+    state = resolveEnemyTurn(state, [1, 6]);
+    const revived = state.players.find(({ id }) => id === sten.id)!;
+    expect(revived.isDead).toBe(false);
+    expect(revived.hp).toBe(Math.ceil(revived.maxHp / 2));
   });
 
-  it("serializes and hydrates pure game state", () => {
-    const state = startReadyRun();
-    const copy = JSON.parse(JSON.stringify(state)) as GameState;
-    expect(copy.selectedPlayers).toHaveLength(4);
-    expect(copy.playDeck.length).toBeGreaterThan(0);
+  it("keeps combat alive when the last fallen hero has Bonfire pending", () => {
+    let state = setupRoom("room-1", ["sten-the-casual", "avg-guy", "hayden-brockensword", "tim-grandmaster-wizard"]);
+    const sten = state.players[0];
+    state = {
+      ...state,
+      players: state.players.map((player) =>
+        player.id === sten.id ? { ...player, hp: 1 } : { ...player, hp: 0, isDead: true },
+      ),
+    };
+    state = atTurn(state, (slot) => slot.actorType === "enemy" && slot.actionId === "1");
+    state = resolveEnemyTurn(state, [1]);
+    expect(state.phase).toBe("COMBAT");
+    expect(state.players.find(({ id }) => id === sten.id)?.isDead).toBe(false);
+    expect(state.players.find(({ id }) => id === sten.id)?.hp).toBe(Math.ceil(sten.maxHp / 2));
   });
 
-  it("can start every seeded combat room and resolve every enemy action without TODO fallbacks", () => {
+  it("makes the cute baby wolf untargetable until all other enemies die", () => {
+    let state = setupRoom("room-4");
+    expect(getTargetableEnemies(state).map(({ definitionId }) => definitionId)).not.toContain("baby-wolf");
+    if (state.currentRoom?.type !== "combat") throw new Error("Expected combat.");
+    state = {
+      ...state,
+      currentRoom: {
+        ...state.currentRoom,
+        enemies: state.currentRoom.enemies.map((enemy) =>
+          enemy.definitionId === "baby-wolf" ? enemy : { ...enemy, hp: 0, isDead: true },
+        ),
+      },
+    };
+    expect(getTargetableEnemies(state).map(({ definitionId }) => definitionId)).toEqual(["baby-wolf"]);
+  });
+});
+
+describe("seeded effects and passives", () => {
+  it("resolves every seeded enemy action without unsupported-effect fallbacks", () => {
     for (const room of dungeonCrawlContent.rooms) {
-      for (const [index, slot] of room.turnOrder.entries()) {
-        if (!slot.startsWith("enemy:")) {
-          continue;
-        }
-        let state = startSpecificCombatRoom(startReadyRun(), dungeonCrawlContent, room.id);
-        state.turn = { index, round: 1 };
-        state.selectedPlayers.forEach((player) => {
-          player.hp = 80;
-          player.maxHp = 80;
-          player.dead = false;
-        });
-
-        expect(() => {
-          state = resolveEnemyTurn(state, dungeonCrawlContent);
-        }, `${room.id} ${slot}`).not.toThrow();
-        expect(state.log.some((entry) => entry.text.includes("TODO:"))).toBe(false);
+      const base = setupRoom(room.id);
+      for (const [index, slot] of base.turn!.order.entries()) {
+        if (slot.actorType !== "enemy") continue;
+        let state = setupRoom(room.id);
+        state = {
+          ...state,
+          players: state.players.map((player) => ({ ...player, hp: 100, maxHp: 100, isDead: false })),
+          currentRoom: state.currentRoom?.type === "combat"
+            ? {
+                ...state.currentRoom,
+                enemies: state.currentRoom.enemies.map((enemy) => ({ ...enemy, hp: 100, maxHp: 100, isDead: false })),
+              }
+            : state.currentRoom,
+          turn: { ...state.turn!, index },
+        };
+        state = resolveEnemyTurn(state, Array(12).fill(6));
+        expect(
+          state.log.some(({ message }) => message.includes("not implemented") || message.includes("skipped safely")),
+          `${room.id}/${slot.raw}`,
+        ).toBe(false);
       }
     }
   });
 
-  it("resolves every seeded player ability without TODO fallbacks", () => {
+  it("resolves every active seeded hero ability without unsupported-effect fallbacks", () => {
     for (const character of dungeonCrawlContent.characters) {
       for (const ability of character.abilities) {
-        let state = startReadyRunWith(character.id);
-        state = startSpecificCombatRoom(state, dungeonCrawlContent, "room-8");
-        const player = state.selectedPlayers[0];
-        const playerTurnIndex = state.currentRoom?.turnOrder.indexOf("player:A") ?? -1;
-        state.turn = { index: playerTurnIndex, round: 1 };
-        state.selectedPlayers.forEach((candidate) => {
-          candidate.hp = 40;
-          candidate.maxHp = 40;
-          candidate.dead = false;
-        });
-        state.currentRoom?.enemies.forEach((enemy) => {
-          enemy.hp = 40;
-          enemy.maxHp = 40;
-          enemy.dead = false;
-        });
-
-        const { targetIds, allocation } = inputsForAbility(state, ability.id);
-        expect(() => {
-          state = usePlayerAbility(state, dungeonCrawlContent, player.id, ability.id, targetIds, allocation);
-        }, `${character.id} ${ability.id}`).not.toThrow();
-        expect(state.log.some((entry) => entry.text.includes("TODO:"))).toBe(false);
+        if (ability.effects.every(({ type }) => type === "passiveRevive")) continue;
+        const party = [character.id, ...defaultParty].filter((id, index, ids) => ids.indexOf(id) === index).slice(0, 4);
+        let state = setupRoom("room-8", party, `ability-${character.id}-${ability.id}`);
+        state = atTurn(state, (slot) => slot.actorType === "player" && slot.position === "A");
+        if (state.currentRoom?.type !== "combat") throw new Error("Expected combat.");
+        state = {
+          ...state,
+          players: state.players.map((player) => ({ ...player, hp: 50, maxHp: 50, isDead: false })),
+          currentRoom: {
+            ...state.currentRoom,
+            enemies: state.currentRoom.enemies.map((enemy) => ({ ...enemy, hp: 50, maxHp: 50, isDead: false })),
+          },
+        };
+        const actor = state.players.find(({ position }) => position === "A")!;
+        const enemies = getTargetableEnemies(state);
+        const allies = state.players.filter(({ id }) => id !== actor.id);
+        const primary = ability.effects[0];
+        const totalDamage = Number(primary.totalDamage ?? 0);
+        const totalHealing = Number(primary.totalHealing ?? 0);
+        const targetIds = primary.type === "attackEnemies" && primary.target === "allEnemies"
+          ? enemies.map(({ id }) => id)
+          : primary.type === "attackEnemies"
+            ? enemies.slice(0, Number(primary.targetCount ?? 1)).map(({ id }) => id)
+            : primary.type === "healAlly" || (primary.type === "applyModifier" && ["ally", "selfAndAlly"].includes(String(primary.target)))
+              ? [allies[0].id]
+              : primary.type === "attackEnemy" ? [enemies[0].id] : [];
+        const allocation = primary.type === "splitDamage"
+          ? { [enemies[0].id]: totalDamage }
+          : primary.type === "splitHeal" ? { [allies[0].id]: totalHealing } : undefined;
+        state = usePlayerAbility(state, { playerId: actor.id, abilityId: ability.id, targetIds, allocation }, Array(8).fill(6));
+        expect(
+          state.log.some(({ message }) => message.includes("not implemented") || message.includes("skipped safely")),
+          `${character.id}/${ability.id}`,
+        ).toBe(false);
       }
     }
   });
 
-  it("implements placeholder item effects for Lucky Token and Guard Charm", () => {
-    let state = startReadyRun();
-    state = startSpecificCombatRoom(state, dungeonCrawlContent, "room-1");
-    const player = state.selectedPlayers[0];
-    player.lootIds = ["lucky-token", "guard-charm"];
-    state.turn = { index: state.currentRoom!.turnOrder.indexOf("player:A"), round: 1 };
-
-    state = useLootCard(state, dungeonCrawlContent, player.id, "lucky-token");
-    expect(state.pendingPlayerReroll?.playerId).toBe(player.id);
-    state = usePlayerAbility(state, dungeonCrawlContent, player.id, "lights-slice", ["giant"]);
-    expect(state.pendingPlayerReroll).toBeNull();
-    expect(state.selectedPlayers[0].usedLootThisRoom).toContain("lucky-token");
-
-    state = startSpecificCombatRoom(state, dungeonCrawlContent, "room-1");
-    state.selectedPlayers[0].lootIds = ["guard-charm"];
-    state = useLootCard(state, dungeonCrawlContent, state.selectedPlayers[0].id, "guard-charm");
-    expect(state.modifiers.some((modifier) => modifier.duration === "nextBlock" && modifier.stat === "def")).toBe(true);
+  it("ticks Fire Ball at the target enemy's next turn start", () => {
+    let state = setupRoom("room-1", ["tim-grandmaster-wizard", "avg-guy", "hayden-brockensword", "sten-the-casual"]);
+    state = atTurn(state, (slot) => slot.actorType === "player" && slot.position === "A");
+    state = updateEnemyHp(state, "giant", 10);
+    const enemyId = getTargetableEnemies(state)[0].id;
+    state = usePlayerAbility(state, { playerId: state.players[0].id, abilityId: "fire-ball", targetIds: [enemyId] }, [6]);
+    const giant = state.currentRoom?.type === "combat" ? state.currentRoom.enemies[0] : undefined;
+    expect(giant?.hp).toBe(4);
+    expect(state.log.some(({ message }) => message.includes("ongoing damage"))).toBe(true);
   });
 
-  it("applies equipment bonuses, max HP cap, consumables, and inventory transfer", () => {
-    let state = startReadyRun();
-    const playerA = state.selectedPlayers[0];
-    const playerB = state.selectedPlayers[1];
-    playerA.maxHp = 23;
-    playerA.hp = 10;
-    playerA.lootIds = ["well-made-chainmail", "archers-gloves", "keen-blade", "heart-amulet"];
-    const stats = getPlayerEffectiveStats(state, dungeonCrawlContent, playerA);
-    expect(stats.maxHp).toBe(24);
-    expect(stats.acc).toBe(playerA.acc + 1);
-    expect(stats.def).toBe(playerA.def + 1);
-    expect(stats.dmg).toBe(1);
-
-    playerA.lootIds = ["minor-healing-potion"];
-    state.lootDeck = [];
-    state = useLootCard(state, dungeonCrawlContent, playerA.id, "minor-healing-potion");
-    expect(state.selectedPlayers[0].hp).toBe(12);
-    expect(state.selectedPlayers[0].lootIds).not.toContain("minor-healing-potion");
-    expect(state.lootDeck.at(-1)).toBe("minor-healing-potion");
-
-    state.selectedPlayers[0].lootIds = ["guard-charm"];
-    state.selectedPlayers[1].lootIds = [];
-    state = transferPlayerLoot(state, dungeonCrawlContent, playerA.id, playerB.id, "guard-charm");
-    expect(state.selectedPlayers[0].lootIds).not.toContain("guard-charm");
-    expect(state.selectedPlayers[1].lootIds).toContain("guard-charm");
+  it("applies and consumes Robin's next-enemy-action ACC debuff", () => {
+    let state = setupRoom("room-1", ["robin-master-assassin", "avg-guy", "hayden-brockensword", "sten-the-casual"]);
+    state = atTurn(state, (slot) => slot.actorType === "player" && slot.position === "A");
+    const enemyId = getTargetableEnemies(state)[0].id;
+    state = usePlayerAbility(state, { playerId: state.players[0].id, abilityId: "debilitating-strike", targetIds: [enemyId] }, [6]);
+    const enemy = state.currentRoom?.type === "combat" ? state.currentRoom.enemies[0] : undefined;
+    expect(enemy && getEffectiveEnemyStats(state, enemy).acc).toBe(5);
+    state = resolveEnemyTurn(state); // Giant action 3 heals and consumes its next-action modifier.
+    const after = state.currentRoom?.type === "combat" ? state.currentRoom.enemies[0] : undefined;
+    expect(after && getEffectiveEnemyStats(state, after).acc).toBe(7);
   });
 
-  it("resolves vendor and witch special-room loot flows", () => {
-    let state = startReadyRun();
-    state.phase = "SPECIAL_ROOM";
-    state.currentSpecialId = "vendor";
-    state.selectedPlayers[0].lootIds = ["well-made-chainmail", "keen-blade"];
-    state.vendor = {
-      drawIds: ["archers-gloves", "heart-amulet"],
-      selectedPaymentIds: ["well-made-chainmail", "keen-blade"],
-      selectedTakeId: "archers-gloves",
-      selectedRecipientId: state.selectedPlayers[1].id
+  it("heals all skeleton-named enemies with Bone Rattle", () => {
+    let state = setupRoom("room-3");
+    if (state.currentRoom?.type !== "combat") throw new Error("Expected combat.");
+    state = {
+      ...state,
+      currentRoom: {
+        ...state.currentRoom,
+        enemies: state.currentRoom.enemies.map((enemy) => ({ ...enemy, hp: Math.max(1, enemy.maxHp - 5) })),
+      },
     };
-    state = completeVendorTrade(state, dungeonCrawlContent);
-    expect(state.selectedPlayers[0].lootIds).toEqual([]);
-    expect(state.selectedPlayers[1].lootIds).toContain("archers-gloves");
-    expect(state.lootDiscard).toEqual(expect.arrayContaining(["well-made-chainmail", "keen-blade"]));
-    expect(state.lootDeck).toContain("heart-amulet");
-
-    state = startReadyRun();
-    state.phase = "SPECIAL_ROOM";
-    state.currentSpecialId = "witch";
-    state.lootDeck = ["well-made-chainmail", "minor-healing-potion"];
-    state.selectedPlayers[0].hp = 10;
-    state = resolveWitchTrade(state, dungeonCrawlContent, state.selectedPlayers[0].id);
-    expect(state.selectedPlayers[0].hp).toBe(6);
-    expect(state.selectedPlayers[0].lootIds).toContain("minor-healing-potion");
-    expect(state.lootDeck).toContain("well-made-chainmail");
-    expect(state.lootDiscard).not.toContain("well-made-chainmail");
+    const before = state.currentRoom?.type === "combat" ? state.currentRoom.enemies.map(({ hp }) => hp) : [];
+    state = atTurn(state, (slot) => slot.actorType === "enemy" && slot.actionId === "3");
+    state = resolveEnemyTurn(state);
+    const after = state.currentRoom?.type === "combat" ? state.currentRoom.enemies.map(({ hp }) => hp) : [];
+    expect(after).toEqual(before.map((hp: number) => hp + 3));
   });
 
-  it("implements seeded passives for target lock, death burst, and Sten revive", () => {
-    let state = startSpecificCombatRoom(startReadyRun(), dungeonCrawlContent, "room-4");
-    const babyWolf = state.currentRoom!.enemies.find((enemy) => enemy.id === "baby-wolf")!;
-    expect(isEnemyTargetable(state.currentRoom!, babyWolf)).toBe(false);
-    state.currentRoom!.enemies.filter((enemy) => enemy.id !== "baby-wolf").forEach((enemy) => {
-      enemy.dead = true;
-    });
-    expect(isEnemyTargetable(state.currentRoom!, babyWolf)).toBe(true);
-
-    state = startSpecificCombatRoom(startReadyRun(), dungeonCrawlContent, "room-8");
-    const fleshGolem = state.currentRoom!.enemies.find((enemy) => enemy.id === "flesh-golem")!;
-    fleshGolem.hp = 1;
-    const beforeHp = state.selectedPlayers[0].hp;
-    state.turn = { index: state.currentRoom!.turnOrder.indexOf("player:A"), round: 1 };
-    state = usePlayerAbility(state, dungeonCrawlContent, state.selectedPlayers[0].id, "lights-slice", ["flesh-golem"]);
-    expect(state.selectedPlayers[0].hp).toBe(beforeHp - 1);
-
-    state = startReadyRunWith("sten-the-casual");
-    state = startSpecificCombatRoom(state, dungeonCrawlContent, "room-1");
-    state.currentRoom!.turnOrder = ["player:A"];
-    state.turn = { index: 0, round: 1 };
-    state.selectedPlayers[0].dead = true;
-    state.selectedPlayers[0].hp = 0;
-    state.selectedPlayers[0].pendingReviveTurns = 1;
-    state = usePlayerAbility(state, dungeonCrawlContent, state.selectedPlayers[0].id, "bad-sword", ["giant"]);
-    expect(state.selectedPlayers[0].dead).toBe(false);
-    expect(state.selectedPlayers[0].hp).toBeGreaterThan(0);
+  it("charges and consumes Doomsayer tokens for Apocalypse", () => {
+    let state = setupRoom("room-6");
+    for (let count = 0; count < 3; count += 1) {
+      state = atTurn(state, (slot) => slot.actorType === "enemy" && slot.actionId === "2");
+      state = resolveEnemyTurn(state);
+    }
+    state = atTurn(state, (slot) => slot.actorType === "enemy" && slot.actionId === "3");
+    const before = state.players.map(({ hp }) => hp);
+    state = resolveEnemyTurn(state, [1, 1, 1, 1]);
+    const doomsayer = state.currentRoom?.type === "combat"
+      ? state.currentRoom.enemies.find(({ definitionId }) => definitionId === "doomsayer")
+      : undefined;
+    expect(doomsayer?.counters.doomTokens).toBe(0);
+    expect(state.players.map(({ hp }) => hp)).toEqual(before.map((hp) => Math.max(0, hp - 8)));
   });
 
-  it("supports victory, defeat, DOT, and once-per-encounter ability limits", () => {
-    let state = startSpecificCombatRoom(startReadyRun(), dungeonCrawlContent, "boss-valeria-spider-queen");
-    state.currentRoom!.enemies[0].hp = 1;
-    state.turn = { index: state.currentRoom!.turnOrder.indexOf("player:A"), round: 1 };
-    state = usePlayerAbility(state, dungeonCrawlContent, state.selectedPlayers[0].id, "lights-slice", ["valeria"]);
-    expect(state.phase).toBe("VICTORY");
+  it("uses Optimize stacks as future Mechanical Golem damage", () => {
+    let state = setupRoom("room-8");
+    state = updateEnemyHp(state, "mechanical-golem", 17);
+    state = atTurn(state, (slot) => slot.actorType === "enemy" && slot.actionId === "4");
+    state = resolveEnemyTurn(state);
+    const mechanical = state.currentRoom?.type === "combat"
+      ? state.currentRoom.enemies.find(({ definitionId }) => definitionId === "mechanical-golem")
+      : undefined;
+    expect(mechanical?.hp).toBe(20);
+    expect(mechanical?.counters.optimizedStacks).toBe(1);
+    state = atTurn(state, (slot) => slot.actorType === "enemy" && slot.actionId === "3");
+    const target = state.players.find(({ position }) => position === "C")!;
+    const before = target.hp;
+    state = resolveEnemyTurn(state, [1]);
+    expect(state.players.find(({ id }) => id === target.id)!.hp).toBe(before - 5);
+  });
 
-    state = startSpecificCombatRoom(startReadyRun(), dungeonCrawlContent, "room-4");
-    state.selectedPlayers.forEach((player) => {
-      player.hp = 1;
-      player.dead = false;
-    });
-    state.currentRoom!.turnOrder = ["enemy:baby-wolf:1"];
-    state.turn = { index: 0, round: 1 };
-    state = resolveEnemyTurn(state, dungeonCrawlContent);
-    expect(state.phase).toBe("DEFEAT");
+  it("resolves Valeria's double block and skips a twice-hit hero", () => {
+    let state = setupRoom("boss-valeria-spider-queen");
+    const first = state.players.find(({ position }) => position === "A")!;
+    const before = first.hp;
+    state = resolveEnemyTurn(state, [1, 1, 6, 6, 6, 6, 6, 6]);
+    expect(state.players.find(({ id }) => id === first.id)!.hp).toBe(before - 2);
+    const current = getCurrentTurn(state);
+    expect(current?.actorType).toBe("enemy");
+    expect(current?.actorType === "enemy" ? current.actionId : null).toBe("2");
+  });
 
-    state = startReadyRunWith("tim-grandmaster-wizard");
-    state = startSpecificCombatRoom(state, dungeonCrawlContent, "room-1");
-    state.rngState = 1;
-    state.currentRoom!.enemies[0].def = -100;
-    state.turn = { index: state.currentRoom!.turnOrder.indexOf("player:A"), round: 1 };
-    state = usePlayerAbility(state, dungeonCrawlContent, state.selectedPlayers[0].id, "fire-ball", ["giant"]);
-    expect(state.currentRoom?.enemies[0].dots.length).toBeGreaterThan(0);
-    const beforeDotHp = state.currentRoom!.enemies[0].hp;
-    state.turn = { index: state.currentRoom!.turnOrder.indexOf("enemy:giant:1"), round: 1 };
-    state = resolveEnemyTurn(state, dungeonCrawlContent);
-    expect(state.currentRoom?.enemies[0].hp).toBeLessThan(beforeDotHp);
-
-    state = startReadyRunWith("tim-grandmaster-wizard");
-    state = startSpecificCombatRoom(state, dungeonCrawlContent, "room-1");
-    state.turn = { index: state.currentRoom!.turnOrder.indexOf("player:A"), round: 1 };
-    state = usePlayerAbility(state, dungeonCrawlContent, state.selectedPlayers[0].id, "misty-step");
-    state.turn = { index: state.currentRoom!.turnOrder.indexOf("player:A"), round: 1 };
-    state = usePlayerAbility(state, dungeonCrawlContent, state.selectedPlayers[0].id, "misty-step");
-    expect(state.log.some((entry) => entry.text.includes("already been used"))).toBe(true);
+  it("triggers Flesh Golem's unblockable on-death damage", () => {
+    let state = setupRoom("room-8");
+    state = atTurn(state, (slot) => slot.actorType === "player" && slot.position === "A");
+    state = updateEnemyHp(state, "flesh-golem", 4);
+    const flesh = getTargetableEnemies(state).find(({ definitionId }) => definitionId === "flesh-golem")!;
+    const before = state.players.map(({ hp }) => hp);
+    state = usePlayerAbility(state, { playerId: state.players[0].id, abilityId: "sword-attack", targetIds: [flesh.id] }, [6]);
+    expect(state.players.map(({ hp }) => hp)).toEqual(before.map((hp) => hp - 1));
   });
 });
 
-function startReadyRunWith(requiredCharacterId?: string): GameState {
-  let state = startNewGame(dungeonCrawlContent, "vitest-seed");
-  const ids = [
-    requiredCharacterId,
-    ...dungeonCrawlContent.characters.map((character) => character.id)
-  ].filter((id, index, allIds): id is string => Boolean(id) && allIds.indexOf(id) === index).slice(0, 4);
-  for (const id of ids) {
-    state = toggleCharacterSelection(state, id);
-  }
-  state = confirmParty(state, dungeonCrawlContent);
-  state = assignPosition(state, state.selectedPlayers[0].id, "A");
-  state = assignPosition(state, state.selectedPlayers[1].id, "B");
-  state = assignPosition(state, state.selectedPlayers[2].id, "C");
-  state = assignPosition(state, state.selectedPlayers[3].id, "D");
-  return confirmPositions(state, dungeonCrawlContent);
-}
+describe("turn and modifier upkeep", () => {
+  it("keeps Misty Step active when cast from the final player position", () => {
+    let state = setupRoom("room-1", ["avg-guy", "hayden-brockensword", "sten-the-casual", "tim-grandmaster-wizard"]);
+    const tim = state.players.find(({ position }) => position === "D")!;
+    state = atTurn(state, (slot) => slot.actorType === "player" && slot.position === "D");
+    state = usePlayerAbility(state, { playerId: tim.id, abilityId: "misty-step" });
+    expect(getEffectivePlayerStats(state, state.players.find(({ id }) => id === tim.id)!).def).toBe(tim.baseDef + 2);
 
-function startReadyRun(): GameState {
-  return startReadyRunWith();
-}
+    const timIndex = state.turn!.order.findIndex((slot) => slot.actorType === "player" && slot.actorId === tim.id);
+    state = { ...state, turn: { ...state.turn!, index: (timIndex - 1 + state.turn!.order.length) % state.turn!.order.length } };
+    state = advanceTurn(state);
+    expect(getEffectivePlayerStats(state, state.players.find(({ id }) => id === tim.id)!).def).toBe(tim.baseDef);
+  });
 
-function inputsForAbility(state: GameState, abilityId: string): { targetIds: string[]; allocation: Record<string, number> } {
-  const enemyIds = state.currentRoom?.enemies.map((enemy) => enemy.id) ?? [];
-  const playerIds = state.selectedPlayers.map((player) => player.id);
-  switch (abilityId) {
-    case "holy-shockwave":
-      return { targetIds: enemyIds.slice(0, 3), allocation: {} };
-    case "multishot":
-      return { targetIds: enemyIds, allocation: {} };
-    case "lay-on-hands":
-    case "defensive-melody":
-    case "offensive-melody":
-    case "guiding-winds":
-    case "winds-of-evasion":
-      return { targetIds: [playerIds[1] ?? playerIds[0]], allocation: {} };
-    case "natures-boon":
-      return { targetIds: [playerIds[1] ?? playerIds[0]], allocation: {} };
-    case "multistrike":
-      return { targetIds: enemyIds, allocation: { [enemyIds[0]]: 6 } };
-    case "healing-hymn":
-      return { targetIds: playerIds, allocation: { [playerIds[0]]: 3 } };
-    case "misty-step":
-    case "decrease-polygon-count":
-    case "bonfire":
-    case "breeze-of-healing":
-      return { targetIds: [], allocation: {} };
-    default:
-      return { targetIds: enemyIds.slice(0, 1), allocation: {} };
-  }
-}
+  it("prevents non-stacking melodies and expires them after three target actions", () => {
+    let state = setupRoom("room-1", ["blane-harmonys-composer", "avg-guy", "hayden-brockensword", "sten-the-casual"]);
+    const blane = state.players[0];
+    const ally = state.players[1];
+    state = atTurn(state, (slot) => slot.actorType === "player" && slot.position === "A");
+    state = usePlayerAbility(state, { playerId: blane.id, abilityId: "defensive-melody", targetIds: [ally.id] });
+    expect(state.modifiers.filter(({ targetId, stat }) => targetId === ally.id && stat === "def")).toHaveLength(1);
+    state = atTurn(state, (slot) => slot.actorType === "player" && slot.position === "A");
+    state = usePlayerAbility(state, { playerId: blane.id, abilityId: "defensive-melody", targetIds: [ally.id] });
+    expect(state.modifiers.filter(({ targetId, stat }) => targetId === ally.id && stat === "def")).toHaveLength(1);
 
-function startRoomOne(): GameState {
-  let state = startReadyRun();
-  state.currentRoom = {
-    definitionId: "room-1",
-    name: "Room 1",
-    tier: "A",
-    type: "combat",
-    lootReward: 2,
-    turnOrder: ["player:A"],
-    enemies: [
-      {
-        id: "giant",
-        name: "Giant",
-        maxHp: 25,
-        hp: 25,
-        acc: 7,
-        def: 4,
-        tags: [],
-        actions: [],
-        passives: [],
-        dead: false,
-        passiveTriggered: [],
-        counters: {},
-        dots: [],
-        skipNextAction: false
-      }
-    ]
-  };
-  state.phase = "COMBAT";
-  state.turn = { index: 0, round: 1 };
-  return state;
-}
+    const enemyId = getTargetableEnemies(state)[0].id;
+    for (let count = 0; count < 3; count += 1) {
+      state = atTurn(state, (slot) => slot.actorType === "player" && slot.position === "B");
+      state = usePlayerAbility(state, { playerId: ally.id, abilityId: "sword-attack", targetIds: [enemyId] }, [6]);
+    }
+    expect(state.modifiers.some(({ targetId, stat }) => targetId === ally.id && stat === "def")).toBe(false);
+  });
+
+  it("increments the round counter when the final turn slot resolves", () => {
+    let state = setupRoom("room-1");
+    state = atTurn(state, (slot) => slot.actorType === "player" && slot.position === "D");
+    const enemyId = getTargetableEnemies(state)[0].id;
+    state = usePlayerAbility(state, { playerId: state.players[3].id, abilityId: "bad-sword", targetIds: [enemyId] }, [6]);
+    expect(state.turn?.round).toBe(2);
+  });
+});
+
+describe("loot, special rooms, victory, and saves", () => {
+  it("reveals the second room after every first-room reward is assigned or discarded", () => {
+    let state = startNewGame(createTitleState(), "first-room-progression");
+    for (const characterId of defaultParty) state = toggleCharacterSelection(state, characterId);
+    state = confirmParty(state);
+    (["A", "B", "C", "D"] as PlayerPosition[]).forEach((position, index) => {
+      state = assignPosition(state, state.players[index].id, position);
+    });
+    const expectedSecondRoom = state.playDeck[1];
+
+    state = confirmPositions(state);
+    state = enterRevealedRoom(state);
+    state = atTurn(state, (slot) => slot.actorType === "player" && slot.position === "A");
+    if (state.currentRoom?.type !== "combat") throw new Error("Expected the first deck room to be combat.");
+    const target = state.currentRoom.enemies[0];
+    state = {
+      ...state,
+      currentRoom: {
+        ...state.currentRoom,
+        enemies: state.currentRoom.enemies.map((enemy) =>
+          enemy.id === target.id
+            ? { ...enemy, hp: 4, isDead: false }
+            : { ...enemy, hp: 0, isDead: true },
+        ),
+      },
+    };
+    state = usePlayerAbility(
+      state,
+      { playerId: state.players[0].id, abilityId: "sword-attack", targetIds: [target.id] },
+      [6],
+    );
+    expect(state.phase).toBe("LOOT_REWARD");
+
+    const rewards = [...state.pendingLootReward];
+    state = assignLoot(state, rewards[0].instanceId, state.players[0].id);
+    for (const reward of rewards.slice(1)) state = assignLoot(state, reward.instanceId, null);
+    expect(state.pendingLootReward).toEqual([]);
+
+    state = continueAfterLoot(state);
+    expect(state.phase).toBe("ROOM_REVEAL");
+    expect(state.roomIndex).toBe(1);
+    expect(state.currentRoom?.definitionId).toBe(expectedSecondRoom.id);
+  });
+
+  it("equips stat loot, enforces inventory, and returns a potion to the deck", () => {
+    let state = setupRoom("room-1");
+    const player = state.players[0];
+    const heart = state.lootDeck.find(({ id }) => id === "heart-amulet")!;
+    const potion = state.lootDeck.find(({ id }) => id === "minor-healing-potion")!;
+    const filler = state.lootDeck.find(({ id }) => id === "keen-blade")!;
+    state = {
+      ...state,
+      phase: "LOOT_REWARD",
+      pendingLootReward: [heart, potion, filler],
+      lootDeck: state.lootDeck.filter(({ instanceId }) => ![heart.instanceId, potion.instanceId, filler.instanceId].includes(instanceId)),
+    };
+    state = assignLoot(state, heart.instanceId, player.id);
+    state = assignLoot(state, potion.instanceId, player.id);
+    state = assignLoot(state, filler.instanceId, player.id);
+    const equipped = state.players.find(({ id }) => id === player.id)!;
+    expect(getEffectivePlayerStats(state, equipped).maxHp).toBe(player.maxHp + 2);
+    state = { ...state, players: state.players.map((current) => (current.id === player.id ? { ...current, hp: 1 } : current)) };
+    state = useLoot(state, player.id, potion.instanceId);
+    expect(state.players.find(({ id }) => id === player.id)!.hp).toBe(3);
+    expect(state.lootDeck.at(-1)?.instanceId).toBe(potion.instanceId);
+  });
+
+  it("auto-equips reusable item loot so its room action is immediately available", () => {
+    let state = setupRoom("room-1");
+    const player = state.players[0];
+    const lucky = state.lootDeck.find(({ id }) => id === "lucky-token")!;
+    state = {
+      ...state,
+      phase: "LOOT_REWARD",
+      pendingLootReward: [lucky],
+      lootDeck: state.lootDeck.filter(({ instanceId }) => instanceId !== lucky.instanceId),
+    };
+    state = assignLoot(state, lucky.instanceId, player.id);
+    expect(state.players[0].equippedLootIds).toContain(lucky.instanceId);
+    state = useLoot(state, player.id, lucky.instanceId);
+    expect(state.pendingRerollPlayerId).toBe(player.id);
+  });
+
+  it("caps max HP at 24 and applies equipped DMG to an attack", () => {
+    let state = setupRoom("room-1");
+    const player = state.players[0];
+    const heart = state.lootDeck.find(({ id }) => id === "heart-amulet")!;
+    const blade = state.lootDeck.find(({ id }) => id === "keen-blade")!;
+    state = {
+      ...state,
+      players: state.players.map((current) =>
+        current.id === player.id
+          ? {
+              ...current,
+              baseMaxHp: 23,
+              maxHp: 23,
+              inventory: [heart, blade],
+              equippedLootIds: [heart.instanceId, blade.instanceId],
+            }
+          : current,
+      ),
+    };
+    expect(getEffectivePlayerStats(state, state.players[0]).maxHp).toBe(24);
+    state = atTurn(state, (slot) => slot.actorType === "player" && slot.position === "A");
+    state = updateEnemyHp(state, "giant", 10);
+    const enemyId = getTargetableEnemies(state)[0].id;
+    state = usePlayerAbility(state, { playerId: player.id, abilityId: "sword-attack", targetIds: [enemyId] }, [6]);
+    const giant = state.currentRoom?.type === "combat" ? state.currentRoom.enemies[0] : undefined;
+    expect(giant?.hp).toBe(5);
+  });
+
+  it("uses Lucky Token and Guard Charm once per room before a block", () => {
+    let state = setupRoom("room-1");
+    const player = state.players[0];
+    const lucky = state.lootDeck.find(({ id }) => id === "lucky-token")!;
+    const guard = state.lootDeck.find(({ id }) => id === "guard-charm")!;
+    state = {
+      ...state,
+      players: state.players.map((current) =>
+        current.id === player.id
+          ? { ...current, inventory: [lucky, guard], equippedLootIds: [lucky.instanceId, guard.instanceId] }
+          : current,
+      ),
+    };
+    state = useLoot(state, player.id, lucky.instanceId);
+    state = useLoot(state, player.id, guard.instanceId);
+    const before = player.hp;
+    state = atTurn(state, (slot) => slot.actorType === "enemy" && slot.actionId === "1");
+    state = resolveEnemyTurn(state, [1, 6, 6]);
+    expect(state.players.find(({ id }) => id === player.id)!.hp).toBe(before);
+    expect(state.pendingRerollPlayerId).toBeNull();
+    expect(state.pendingBlockBonuses[player.id]).toBeUndefined();
+  });
+
+  it("resolves the Healing Spring and Treasure Room rewards", () => {
+    let spring = setupRoom("healing-spring");
+    spring = { ...spring, players: spring.players.map((player) => ({ ...player, hp: 1 })) };
+    spring = resolveHealingSpring(spring);
+    expect(spring.players.every((player) => player.hp === player.maxHp)).toBe(true);
+    expect(continueAfterSpecialRoom(spring).phase).toBe("VICTORY");
+
+    let treasure = setupRoom("treasure-room");
+    const recipients = treasure.players.slice(0, 2).map(({ id }) => id);
+    treasure = resolveTreasureRoom(treasure, recipients, [1, 4]);
+    expect(treasure.players.slice(0, 2).every(({ abilityTokens }) => abilityTokens === 4)).toBe(true);
+
+    let intermediate = setupRoom("treasure-room");
+    intermediate = resolveTreasureRoom(intermediate, recipients, [5, 3]);
+    expect(intermediate.players.every(({ abilityTokens }) => abilityTokens === 3)).toBe(true);
+
+    let basicLoot = setupRoom("treasure-room");
+    basicLoot = resolveTreasureRoom(basicLoot, recipients, [3, 2]);
+    expect(basicLoot.pendingLootReward).toHaveLength(4);
+    expect(basicLoot.pendingLootRecipientIds).toEqual(recipients);
+    const ineligible = basicLoot.players[2];
+    basicLoot = assignLoot(basicLoot, basicLoot.pendingLootReward[0].instanceId, ineligible.id);
+    expect(basicLoot.pendingLootReward).toHaveLength(4);
+
+    let intermediateLoot = setupRoom("treasure-room");
+    intermediateLoot = resolveTreasureRoom(intermediateLoot, recipients, [6, 2]);
+    expect(intermediateLoot.pendingLootReward).toHaveLength(8);
+    expect(intermediateLoot.pendingLootRecipientIds).toHaveLength(4);
+  });
+
+  it("draws vendor offers and accepts exactly two items for one", () => {
+    let state = setupRoom("vendor");
+    expect(state.specialRoomState?.vendorOffer).toHaveLength(4);
+    const [paymentA, paymentB] = state.lootDeck.slice(0, 2);
+    const recipient = state.players[0];
+    state = {
+      ...state,
+      lootDeck: state.lootDeck.slice(2),
+      players: state.players.map((player, index) =>
+        index === 0 ? { ...player, inventory: [paymentA] } : index === 1 ? { ...player, inventory: [paymentB] } : player,
+      ),
+    };
+    const offered = state.specialRoomState!.vendorOffer[0];
+    state = resolveVendorTrade(state, offered.instanceId, recipient.id, [
+      { playerId: state.players[0].id, lootInstanceId: paymentA.instanceId },
+      { playerId: state.players[1].id, lootInstanceId: paymentB.instanceId },
+    ]);
+    expect(state.specialRoomState?.resolved).toBe(true);
+    expect(state.players[0].inventory.some(({ instanceId }) => instanceId === offered.instanceId)).toBe(true);
+  });
+
+  it("lets the Witch exchange 4 HP for the first potion and shuffles other cards back", () => {
+    let state = setupRoom("witch");
+    const player = state.players[0];
+    const before = player.hp;
+    state = resolveWitchRoom(state, player.id);
+    const after = state.players.find(({ id }) => id === player.id)!;
+    expect(after.hp).toBe(before - 4);
+    expect(after.inventory.some(({ tags }) => tags?.includes("potion"))).toBe(true);
+  });
+
+  it("allows leaving the merchant without a trade", () => {
+    const state = leaveVendor(setupRoom("vendor"));
+    expect(state.specialRoomState?.resolved).toBe(true);
+    expect(state.specialRoomState?.vendorOffer).toEqual([]);
+  });
+
+  it("reaches defeat when all players die and victory when the boss dies", () => {
+    let defeat = setupRoom("room-4", ["avg-guy", "hayden-brockensword", "tim-grandmaster-wizard", "robin-master-assassin"]);
+    defeat = { ...defeat, players: defeat.players.map((player) => ({ ...player, hp: 1 })) };
+    defeat = resolveEnemyTurn(defeat);
+    expect(defeat.phase).toBe("DEFEAT");
+
+    let victory = setupRoom("boss-valeria-spider-queen");
+    victory = atTurn(victory, (slot) => slot.actorType === "player" && slot.position === "A");
+    victory = updateEnemyHp(victory, "valeria", 4);
+    const boss = getTargetableEnemies(victory)[0];
+    victory = usePlayerAbility(victory, { playerId: victory.players[0].id, abilityId: "sword-attack", targetIds: [boss.id] }, [6]);
+    expect(victory.phase).toBe("VICTORY");
+  });
+
+  it("round-trips a versioned save while reattaching current content", () => {
+    const state = setupRoom("room-1");
+    const restored = deserializeGame(serializeGame(state));
+    expect(restored.phase).toBe(state.phase);
+    expect(restored.rng).toEqual(state.rng);
+    expect(restored.currentRoom).toEqual(state.currentRoom);
+    expect(restored.content).toBe(dungeonCrawlContent);
+  });
+});

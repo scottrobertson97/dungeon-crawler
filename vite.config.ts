@@ -1,11 +1,14 @@
-import { defineConfig } from "vite";
+import { defineConfig } from "vitest/config";
+
+const pagesBase = process.env.GITHUB_PAGES_BASE ?? "./";
 
 export default defineConfig({
-  base: "./",
+  base: pagesBase,
   build: {
-    chunkSizeWarningLimit: 1600
+    chunkSizeWarningLimit: 1800
   },
   test: {
-    environment: "node"
+    environment: "node",
+    clearMocks: true
   }
 });

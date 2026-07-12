@@ -1,52 +1,89 @@
-import type { GameState } from "./types";
+import { dungeonCrawlContent } from "../data/content";
+import type { DungeonCrawlContent, GameState, RoomDefinition } from "./types";
 
+export const SAVE_VERSION = 1 as const;
 export const SAVE_KEY = "dungeon-crawl-save-v1";
 
-export function saveGame(state: GameState): void {
-  if (state.phase === "TITLE") {
-    return;
-  }
-  localStorage.setItem(SAVE_KEY, JSON.stringify(state));
+export interface StorageLike {
+  getItem(key: string): string | null;
+  setItem(key: string, value: string): void;
+  removeItem(key: string): void;
 }
 
-export function loadGame(): GameState | null {
-  const raw = localStorage.getItem(SAVE_KEY);
-  if (!raw) {
-    return null;
+interface SaveEnvelopeV1 {
+  saveVersion: typeof SAVE_VERSION;
+  state: GameState;
+}
+
+function browserStorage(): StorageLike | null {
+  return typeof globalThis !== "undefined" && "localStorage" in globalThis
+    ? (globalThis.localStorage as StorageLike)
+    : null;
+}
+
+function currentDefinition(content: DungeonCrawlContent, saved: RoomDefinition): RoomDefinition {
+  return (
+    content.rooms.find(({ id }) => id === saved.id) ??
+    content.specialRooms.find(({ id }) => id === saved.id) ??
+    saved
+  );
+}
+
+export function serializeGame(state: GameState): string {
+  const envelope: SaveEnvelopeV1 = { saveVersion: SAVE_VERSION, state };
+  return JSON.stringify(envelope);
+}
+
+export function deserializeGame(
+  serialized: string,
+  content: DungeonCrawlContent = dungeonCrawlContent,
+): GameState {
+  const parsed = JSON.parse(serialized) as Partial<SaveEnvelopeV1>;
+  if (parsed.saveVersion !== SAVE_VERSION) {
+    throw new Error(`Unsupported Dungeon Crawl save version: ${String(parsed.saveVersion)}.`);
   }
+  const state = parsed.state;
+  if (
+    !state ||
+    state.stateVersion !== 1 ||
+    !Array.isArray(state.players) ||
+    !Array.isArray(state.playDeck) ||
+    !Array.isArray(state.log) ||
+    typeof state.phase !== "string"
+  ) {
+    throw new Error("Dungeon Crawl save data is incomplete or corrupt.");
+  }
+  return {
+    ...state,
+    content,
+    playDeck: state.playDeck.map((room) => currentDefinition(content, room)),
+    pendingLootRecipientIds: state.pendingLootRecipientIds ?? null,
+  };
+}
+
+export function saveGame(state: GameState, storage: StorageLike | null = browserStorage()): boolean {
+  if (!storage) return false;
+  storage.setItem(SAVE_KEY, serializeGame(state));
+  return true;
+}
+
+export function loadGame(
+  storage: StorageLike | null = browserStorage(),
+  content: DungeonCrawlContent = dungeonCrawlContent,
+): GameState | null {
+  const serialized = storage?.getItem(SAVE_KEY);
+  if (!serialized) return null;
   try {
-    return normalizeSave(JSON.parse(raw) as GameState);
+    return deserializeGame(serialized, content);
   } catch {
-    localStorage.removeItem(SAVE_KEY);
     return null;
   }
 }
 
-export function hasSaveGame(): boolean {
-  return Boolean(localStorage.getItem(SAVE_KEY));
+export function hasSavedGame(storage: StorageLike | null = browserStorage()): boolean {
+  return Boolean(storage?.getItem(SAVE_KEY));
 }
 
-export function clearSaveGame(): void {
-  localStorage.removeItem(SAVE_KEY);
-}
-
-function normalizeSave(state: GameState): GameState {
-  state.vendor ??= null;
-  state.pendingPlayerReroll ??= null;
-  state.lastEnemyActionHits ??= [];
-  state.modifiers ??= [];
-  state.pendingLootReward ??= [];
-  state.lootDiscard ??= [];
-  state.selectedPlayers = (state.selectedPlayers ?? []).map((player) => ({
-    ...player,
-    lootIds: player.lootIds ?? [],
-    abilityTokens: player.abilityTokens ?? 0,
-    lootedOnDeath: player.lootedOnDeath ?? false,
-    skipNextAction: player.skipNextAction ?? false,
-    pendingReviveTurns: player.pendingReviveTurns ?? null,
-    oncePerEncounterUsed: player.oncePerEncounterUsed ?? [],
-    usedLootThisRoom: player.usedLootThisRoom ?? [],
-    abilityDamageBonusById: player.abilityDamageBonusById ?? {}
-  }));
-  return state;
+export function clearSavedGame(storage: StorageLike | null = browserStorage()): void {
+  storage?.removeItem(SAVE_KEY);
 }
